@@ -1,0 +1,598 @@
+---
+title: "Skin statistical analysis"
+always_allow_html: yes
+date: "Compiled `r Sys.Date()`"
+output:
+  html_document:
+    toc: yes
+    toc_float: yes
+    toc_depth: 5
+    theme: united
+    code_folding: hide
+    collapse: yes
+    css: max.css
+---
+
+[BACK TO INDEX](./index.html)
+
+
+```{r, message=F, warning=F}
+set.seed(123)
+knitr::opts_knit$set(progress=F, verbose=F, warning=F, message=F)
+
+subchunkify <- function(g, fig_height=7, fig_width=5, warning=F) {
+  if(!isTRUE(getOption('knitr.in.progress'))){ print(g); return(); }
+  g_deparsed <- paste0(deparse(function() {g}), collapse='')
+  if(!exists("chunky_id")){ chunky_id <<- 0}
+  chunky_id <<- chunky_id+1
+  sub_chunk <- paste0("\n\n``", "`{r sub_chunky_", chunky_id, ", fig.height=", fig_height, ", fig.width=", fig_width, ", echo=F, warning=", warning, "}",
+  "\n(", g_deparsed, ")()\n\n``", "`\n")
+  cat(knitr::knit(text = knitr::knit_expand(text=sub_chunk), quiet=T))
+}
+
+biramp = function(n) {as.vector(t(cbind(viridis(ceiling(n/2)), colorRampPalette(c('#eedd00', '#ff5533', '#441199'), interpolate="spline", space="Lab")(ceiling(n/2)))))}
+
+library(Seurat)
+library(tidyverse)
+library(DT)
+library(data.table)
+library(ggplot2)
+# remotes::install_github("mojaveazure/seurat-disk")
+# library(SeuratDisk)
+library(ggpubr)
+library(rstatix)
+library(celda)
+library(viridis)
+library(ComplexHeatmap)
+library(circlize)
+library(DESeq2)
+library(ggrepel)
+library(kableExtra)
+# library(RColorBrewer)
+
+library(future)
+plan("multicore", workers=18)
+
+meta = read.csv('meta2.csv', sep='\t', header=T, stringsAsFactors=T)
+meta$Origin = factor(paste(meta$Health, meta$Lesion))
+meta$PVvsHC = factor(ifelse(meta$Health %in% c('PV', 'HC'), as.character(meta$Health), NA), levels=c('PV', 'HC'))
+meta$BPvsHC = factor(ifelse(meta$Health %in% c('BP', 'HC'), as.character(meta$Health), NA), levels=c('BP', 'HC'))
+meta$PSORIvsHC = factor(ifelse(meta$Health %in% c('PSORI', 'HC'), as.character(meta$Health), NA), levels=c('PSORI', 'HC'))
+
+so = readRDS('data/skin.RDS')
+# so = JoinLayers(so, assay='RNA')
+meta = subset(meta, Tissue=='skin' & Sample_Name %in% unique(so@meta.data$Sample_Name))
+```
+
+
+## UMAP from previous clustering
+```{r, fig.width=7, fig.height=6}
+p = DimPlot(so, reduction="iWUMAP", group.by="annotation", label=F, label.size=3, repel=T, shuffle=T, alpha=0.5)
+p; ggsave('sc_skin_umap_cluster.svg', plot=p, width=7, height=5)
+
+p = DimPlot(so, reduction="iWUMAP", group.by="subannotation", label=F, label.size=3, repel=T, shuffle=T, alpha=0.5)
+p; ggsave('sc_skin_umap_subcluster.svg', plot=p, width=7, height=5)
+
+tab = table(so@meta.data$Health, so@meta.data$annotation)
+tabsum = tab %>% addmargins() 
+tabsum %>% kbl(col.names=c('#', colnames(tabsum))) %>% kable_classic(full_width=F)
+round(tab/rowSums(tab)*100, 1) %>% kbl(col.names=c('%', colnames(tab))) %>% kable_classic(full_width=F)
+```
+
+```{r, fig.width=9, fig.height=4}
+DimPlot(so, reduction="iWUMAP", group.by="Run", label=F, label.size=3, repel=T, shuffle=T, alpha=0.5) + DimPlot(so, reduction="iWUMAP", group.by="Lesion", label=F, label.size=3, repel=T, shuffle=T, alpha=0.5)
+```
+
+
+## Reference Annotations
+
+### PBMC reference
+Reference mapping of cell types (left) and subtypes (rights) within combined (AB+RNA) Weighted Nearest Neighbor UMAP coordinates in PBMC dataset.
+```{r, fig.width=11, fig.height=6, warning=F}
+p = DimPlot(so, reduction="iWUMAP", group.by="predicted.pbmc", label=T, label.size=3, repel=T)
+p; ggsave('sc_skin_umap_ref_pbmc.svg', plot=p, width=6, height=5)
+
+p1 = DimPlot(so, reduction="iWUMAP", group.by="predicted.pbmc.l1", label=T, label.size=3, repel=T)# + scale_color_manual(values=as.vector(t(cbind(viridis(4, begin=0.2), rev(plasma(5, begin=0.4))))))
+p2 = DimPlot(so, reduction="iWUMAP", group.by="predicted.pbmc.l2", label=T, label.size=3 ,repel=T) + NoLegend()
+# svg('sc_skin_umap_ref_pbmc_l1l2.svg', width=12, height=6)
+p1 + p2
+# dev.off()
+
+DimPlot(so, reduction="iWUMAP", group.by="predicted.pbmc.l3", label=T, label.size=3, repel=T)
+
+tab = table(so@meta.data$Health, so@meta.data$predicted.pbmc)
+tabsum = tab %>% addmargins() 
+tabsum %>% kbl(col.names=c('#', colnames(tabsum))) %>% kable_classic(full_width=F)
+round(tab/rowSums(tab)*100, 1) %>% kbl(col.names=c('%', colnames(tab))) %>% kable_classic(full_width=F)
+
+tab = table(so@meta.data$Sample_Name, so@meta.data$predicted.pbmc)
+tabsum = tab %>% addmargins() 
+tabsum %>% kbl(col.names=c('#', colnames(tabsum))) %>% kable_classic(full_width=F)
+round(tab/rowSums(tab)*100, 1) %>% kbl(col.names=c('%', colnames(tab))) %>% kable_classic(full_width=F)
+```
+
+#### Cell type composition based on reference mapping
+```{r, fig.width=13, fig.height=4, warning=F}
+p = ggplot(so@meta.data, aes(x=Sample_Name, fill=predicted.pbmc)) + geom_bar(position='fill') + 
+   facet_grid(rows=vars(Health), labeller=label_wrap_gen(width=16, multi_line=F), scales="free", space="free") +
+   theme_classic() + coord_flip() + scale_fill_manual(values=biramp(10)) + ylab('cell composition [%]') + xlab('Samples') + scale_y_continuous(breaks=(0:4)/4, labels=(0:4)*25, expand=c(0.002, 0.002)) + theme(legend.title=element_text(size=11), legend.key.height=unit(4, 'mm'), legend.key.width=unit(8, 'mm'))
+p; ggsave('sc_skin_composition_ref_pbmc.svg', plot=p, width=11, height=4)
+
+p = ggplot(so@meta.data, aes(x=Sample_Name, fill=predicted.pbmc.l2)) + geom_bar(position='fill') + 
+   facet_grid(rows=vars(Health), labeller = label_wrap_gen(width=16, multi_line=F), scales="free", space="free") +
+   theme_classic() + coord_flip() + scale_fill_manual(values=biramp(28)) + ylab('cell composition [%]') + xlab('Samples') + scale_y_continuous(breaks=(0:4)/4, labels=(0:4)*25, expand=c(0.002, 0.002)) + theme(legend.title=element_text(size=11), legend.key.height=unit(4, 'mm'), legend.key.width=unit(8, 'mm'))
+p; ggsave('sc_skin_composition_ref_pbmc_l2.svg', plot=p, width=11, height=4)
+```
+
+#### Annotation prediction on different levels
+not necessarily consistent!
+```{r, fig.width=9, fig.height=3}
+tab = table(so$predicted.pbmc, so$predicted.pbmc.l2)
+tabsum = tab %>% addmargins() 
+tabsum %>% kbl(col.names=c('#', colnames(tabsum))) %>% kable_classic(full_width=F)
+round(tab/rowSums(tab)*100, 1) %>% kbl(col.names=c('%', colnames(tab))) %>% kable_classic(full_width=F)
+```
+
+### Rash reference
+```{r, fig.width=9, fig.height=4}
+DimPlot(so, reduction="iWUMAP", group.by="predicted.skin", label=T, label.size=3, repel=T, shuffle=T, alpha=0.5)
+
+### Cell type composition based on reference mapping
+ggplot(so@meta.data, aes(x=Sample_Name, fill=predicted.skin)) + geom_bar(position='fill') + 
+   facet_grid(rows=vars(Health), labeller = label_wrap_gen(width=16, multi_line=F), scales="free", space="free") +
+   theme_classic() + coord_flip() + scale_fill_manual(values=biramp(30)) + ylab('cell composition [%]') + xlab('Samples') + scale_y_continuous(breaks=(0:4)/4, labels=(0:4)*25) + theme(legend.title=element_text(size=11), legend.key.height=unit(4, 'mm'), legend.key.width=unit(8, 'mm'))
+
+tab = table(so$subcluster, so$predicted.skin)
+tabsum = tab %>% addmargins() 
+tabsum %>% kbl(col.names=c('#', colnames(tabsum))) %>% kable_classic(full_width=F)
+round(tab/rowSums(tab)*100, 1) %>% kbl(col.names=c('%', colnames(tab))) %>% kable_classic(full_width=F)
+
+tab = table(so$predicted.pbmc, so$predicted.skin)
+tabsum = tab %>% addmargins() 
+tabsum %>% kbl(col.names=c('#', colnames(tabsum))) %>% kable_classic(full_width=F)
+round(tab/rowSums(tab)*100, 1) %>% kbl(col.names=c('%', colnames(tab))) %>% kable_classic(full_width=F)
+```
+
+
+
+
+## scType classification
+```{r, fig.width=11, fig.height=8, warning=F, message=F}
+DimPlot(so, reduction="iWUMAP", group.by="scType", label=T, label.size=3, repel=T, shuffle=T)
+
+so.umap = cbind(so@reductions$iWUMAP@cell.embeddings, so@meta.data)
+names(so.umap)[1:2] = c('UMAP1', 'UMAP2')
+ggplot(so.umap) + geom_point(aes(UMAP1, UMAP2, col=scCat, alpha=scType.score), stroke=0, shape=16, size=1) + theme_classic() + guides(color=guide_legend(override.aes=list(alpha=1, size=3)), alpha=guide_legend(override.aes=list(size=4, shape=15))) + scale_colour_manual(values = rainbow(10))
+
+tab = table(so@meta.data$Health, so@meta.data$scCat)
+tabsum = tab %>% addmargins() 
+tabsum %>% kbl(col.names=c('#', colnames(tabsum))) %>% kable_classic(full_width=F)
+round(tab/rowSums(tab)*100, 1) %>% kbl(col.names=c('%', colnames(tab))) %>% kable_classic(full_width=F)
+```
+
+### Cells per Cluster per Celltype
+```{r, fig.width=9, fig.height=3}
+tab = table(so@meta.data$annotation, so@meta.data$scCat)
+tabsum = tab %>% addmargins() 
+tabsum %>% kbl(col.names=c('#', colnames(tabsum))) %>% kable_classic(full_width=F)
+round(tab/rowSums(tab)*100, 1) %>% kbl(col.names=c('%', colnames(tab))) %>% kable_classic(full_width=F)
+```
+
+### Cross-validating cell type annotations
+```{r, fig.width=9, fig.height=3}
+tab = table(so@meta.data$predicted.pbmc, so@meta.data$scCat)
+tabsum = tab %>% addmargins() 
+tabsum %>% kbl(col.names=c('#', colnames(tabsum))) %>% kable_classic(full_width=F)
+round(tab/rowSums(tab)*100, 1) %>% kbl(col.names=c('%', colnames(tab))) %>% kable_classic(full_width=F)
+```
+
+
+## Clusters
+Based on multi modal model above.
+```{r, fig.width=9, fig.height=3.5}
+p = ggplot(so@meta.data, aes(x=Sample_Name, fill=annotation)) + geom_bar(position='fill') + 
+   facet_grid(rows=vars(Health), labeller=label_wrap_gen(width=16, multi_line=F), scales="free", space="free") +
+   scale_fill_manual(values=biramp(10)) +
+   theme_classic() + coord_flip() + ylab('cell composition [%]') + xlab('Samples') + scale_y_continuous(breaks=(0:4)/4, labels=(0:4)*25, expand=c(0.002, 0.002)) + theme(legend.title=element_text(size=11), legend.key.height=unit(4, 'mm'), legend.key.width=unit(8, 'mm'))
+p; ggsave('sc_skin_composition_cluster.svg', plot=p, width=11, height=4)
+
+ggplot(so@meta.data, aes(x=Sample_Name, fill=subannotation)) + geom_bar(position='fill') + 
+   facet_grid(rows=vars(Run), labeller=label_wrap_gen(width=16, multi_line=F), scales="free", space="free") +
+   scale_fill_manual(values=biramp(17)) +
+   coord_flip() + labs(y='# cells', x='', title='Cells per sample') + theme_classic() + scale_y_continuous(breaks=(0:4)/4, labels=(0:4)*25, expand=c(0.002, 0.002)) + guides(fill=guide_legend(ncol=2)) + theme(legend.key.size = unit(0.4, "cm"))
+```
+
+### Cells per Cluster per Condition
+```{r, fig.width=9, fig.height=2}
+tab = table(so@meta.data$annotation, so@meta.data$Health)
+tabsum = tab %>% addmargins() 
+tabsum %>% kbl(col.names=c('#', colnames(tabsum))) %>% kable_classic(full_width=F)
+round(tab/rowSums(tab)*100, 1) %>% kbl(col.names=c('%', colnames(tab))) %>% kable_classic(full_width=F)
+
+with(subset(so@meta.data, Run==1), {
+tab = table(Health, annotation)
+tabsum = tab %>% addmargins() 
+tabsum %>% kbl(col.names=c('#', colnames(tabsum))) %>% kable_classic(full_width=F)
+round(tab/rowSums(tab)*100, 1) %>% kbl(col.names=c('%', colnames(tab))) %>% kable_classic(full_width=F)
+})
+with(subset(so@meta.data, Run==2), {
+tab = table(Health, annotation)
+tabsum = tab %>% addmargins() 
+tabsum %>% kbl(col.names=c('#', colnames(tabsum))) %>% kable_classic(full_width=F)
+round(tab/rowSums(tab)*100, 1) %>% kbl(col.names=c('%', colnames(tab))) %>% kable_classic(full_width=F)
+})
+
+with(subset(so@meta.data, Run==1), {
+tab = table(Sample_Name, annotation)
+tabsum = tab %>% addmargins() 
+tabsum %>% kbl(col.names=c('#', colnames(tabsum))) %>% kable_classic(full_width=F)
+round(tab/rowSums(tab)*100, 1) %>% kbl(col.names=c('%', colnames(tab))) %>% kable_classic(full_width=F)
+})
+with(subset(so@meta.data, Run==2), {
+tab = table(Sample_Name, annotation)
+tabsum = tab %>% addmargins() 
+tabsum %>% kbl(col.names=c('#', colnames(tabsum))) %>% kable_classic(full_width=F)
+round(tab/rowSums(tab)*100, 1) %>% kbl(col.names=c('%', colnames(tab))) %>% kable_classic(full_width=F)
+})
+```
+
+### Cells per Cluster per Reference Celltype
+```{r, fig.width=9, fig.height=3.5}
+p = ggplot(so@meta.data, aes(x=annotation, fill=predicted.pbmc)) + geom_bar(position='fill') + 
+   scale_fill_manual(values=biramp(12)) +
+   theme_classic() + coord_flip() + ylab('cell composition [%]') + xlab('Clusters') + scale_y_continuous(breaks=(0:4)/4, labels=(0:4)*25, expand=c(0.002, 0.002)) + theme(legend.title=element_text(size=11), legend.key.height=unit(4, 'mm'), legend.key.width=unit(8, 'mm'))
+p; ggsave('sc_skin_composition_cluster_ref_pbmc.svg', plot=p, width=11, height=4)
+
+tab = table(so@meta.data$annotation, so@meta.data$predicted.pbmc)
+tabsum = tab %>% addmargins() 
+tabsum %>% kbl(col.names=c('#', colnames(tabsum))) %>% kable_classic(full_width=F)
+round(tab/rowSums(tab)*100, 1) %>% kbl(col.names=c('%', colnames(tab))) %>% kable_classic(full_width=F)
+
+p = ggplot(so@meta.data, aes(x=annotation, fill=predicted.pbmc.l2)) + geom_bar(position='fill') + 
+   scale_fill_manual(values=biramp(28)) +
+   theme_classic() + coord_flip() + ylab('cell composition [%]') + xlab('Clusters') + scale_y_continuous(breaks=(0:4)/4, labels=(0:4)*25, expand=c(0.002, 0.002)) + theme(legend.title=element_text(size=11), legend.key.height=unit(4, 'mm'), legend.key.width=unit(8, 'mm'))
+p; ggsave('sc_skin_composition_cluster_ref_pbmc_l2.svg', plot=p, width=11, height=4)
+
+tab = table(so@meta.data$annotation, so@meta.data$predicted.pbmc.l2)
+tabsum = tab %>% addmargins() 
+tabsum %>% kbl(col.names=c('#', colnames(tabsum))) %>% kable_classic(full_width=F)
+round(tab/rowSums(tab)*100, 1) %>% kbl(col.names=c('%', colnames(tab))) %>% kable_classic(full_width=F)
+
+p = ggplot(so@meta.data, aes(x=annotation, fill=predicted.skin)) + geom_bar(position='fill') + 
+   scale_fill_manual(values=biramp(30)) +
+   theme_classic() + coord_flip() + ylab('cell composition [%]') + xlab('Clusters') + scale_y_continuous(breaks=(0:4)/4, labels=(0:4)*25, expand=c(0.002, 0.002)) + theme(legend.title=element_text(size=11), legend.key.height=unit(4, 'mm'), legend.key.width=unit(8, 'mm'))
+p; ggsave('sc_skin_composition_cluster_ref_skin.svg', plot=p, width=11, height=4)
+
+tab = table(so@meta.data$annotation, so@meta.data$predicted.skin)
+tabsum = tab %>% addmargins() 
+tabsum %>% kbl(col.names=c('#', colnames(tabsum))) %>% kable_classic(full_width=F)
+round(tab/rowSums(tab)*100, 1) %>% kbl(col.names=c('%', colnames(tab))) %>% kable_classic(full_width=F)
+```
+
+```{r, fig.width=9, fig.height=3}
+tab = table(so@meta.data$predicted.pbmc, so@meta.data$annotation)
+tabsum = tab %>% addmargins() 
+tabsum %>% kbl(col.names=c('#', colnames(tabsum))) %>% kable_classic(full_width=F)
+round(tab/rowSums(tab)*100, 1) %>% kbl(col.names=c('%', colnames(tab))) %>% kable_classic(full_width=F)
+
+tab = table(so@meta.data$predicted.pbmc.l2, so@meta.data$annotation)
+tabsum = tab %>% addmargins() 
+tabsum %>% kbl(col.names=c('#', colnames(tabsum))) %>% kable_classic(full_width=F)
+round(tab/rowSums(tab)*100, 1) %>% kbl(col.names=c('%', colnames(tab))) %>% kable_classic(full_width=F)
+
+tab = table(so@meta.data$predicted.skin, so@meta.data$annotation)
+tabsum = tab %>% addmargins() 
+tabsum %>% kbl(col.names=c('#', colnames(tabsum))) %>% kable_classic(full_width=F)
+round(tab/rowSums(tab)*100, 1) %>% kbl(col.names=c('%', colnames(tab))) %>% kable_classic(full_width=F)
+```
+
+
+### Top markers per cluster
+To characterize the clusters further, top up/down regulated features compared to the rest of the clusters are identified.
+
+#### Transcript markers
+```{r, fig.width=11, fig.height=5, warning=F, message=F}
+Idents(so) = so@meta.data$annotation
+so = JoinLayers(so, assay='RNA')
+# so.rna.presto.markers = presto:::wilcoxauc.Seurat(X=so, group_by='seurat_clusters', assay='data', seurat_assay='SCT')
+so.rna.markers = FindAllMarkers(so, min.pct=0.25, verbose=F, assay='RNA')
+so.rna.markers.top = so.rna.markers %>% group_by(cluster) %>% top_n(2, avg_log2FC)
+so.rna.markers.top = so.rna.markers.top[, c('gene', 'cluster', 'avg_log2FC', 'p_val_adj')]
+so.rna.markers.top$avg_log2FC = signif(so.rna.markers.top$avg_log2FC, digits=2)
+so.rna.markers.top$p_val_adj = signif(so.rna.markers.top$p_val_adj, digits=2)
+
+# p = DotPlot(so, features=unique(so.rna.markers.top$gene), scale.by='size', scale=T) + scico::scale_color_scico(palette = "vik") + RotatedAxis()
+# p; ggsave('sc_skin_dotplot_cluster.svg', plot=p, width=9, height=4)
+
+DoHeatmap(so, features=unique(so.rna.markers.top$gene), size=3, slot='counts', disp.max=10) + scale_fill_viridis()
+```
+
+```{r, fig.width=11, fig.height=5, warning=F, message=F}
+datatable(so.rna.markers.top, filter='top', extensions = 'Buttons', options = list(dom = 'Bfrtip', buttons = c('copy', 'csv', 'excel', 'pdf', 'print')))
+```
+
+##### Subcluster Profiles
+Specific expression profile compared also to all other clusters:
+```{r, fig.width=7, fig.height=4, warning=F, message=F}
+Idents(so) = so$subcluster
+so.rna.markers = FindAllMarkers(so, min.pct=0.25, verbose=F, assay='RNA')
+so.rna.markers.top = so.rna.markers %>% group_by(cluster) %>% filter(grepl('3_', cluster)) %>% top_n(2, avg_log2FC)
+
+p = DotPlot(so, features=unique(so.rna.markers.top$gene), scale.by='size', scale=T) + scico::scale_color_scico(palette = "vik") + RotatedAxis()
+p; ggsave('sc_skin_dotplot_subcluster.svg', plot=p, width=11, height=5)
+```
+
+Just compared within cluster 3
+```{r, fig.width=7, fig.height=3.5, warning=F, message=F}
+so.rna.markers = FindAllMarkers(subset(so, cluster==3), min.pct=0.25, verbose=F, assay='RNA')
+so.rna.markers.top = so.rna.markers %>% group_by(cluster) %>% filter(grepl('3_', cluster)) %>% top_n(2, avg_log2FC)
+# DotPlot(subset(so, cluster==3), features=unique(so.rna.markers.top$gene), scale.by='size', scale=T) + scico::scale_color_scico(palette = "vik") + RotatedAxis()
+```
+
+
+#### Surface Markers
+```{r, fig.width=7, fig.height=6}
+# so = JoinLayers(so, assay='AB')
+so.ab.markers = FindAllMarkers(so, min.pct=0.25, verbose=F, assay='AB')
+so.ab.markers.top = so.ab.markers %>% group_by(cluster) %>% top_n(10, avg_log2FC)
+so.ab.markers.flop = so.ab.markers %>% group_by(cluster) %>% top_n(10, -avg_log2FC)
+so.ab.markers.top = rbind(so.ab.markers.top, so.ab.markers.flop)[, c('gene', 'cluster', 'avg_log2FC', 'p_val_adj')]
+so.ab.markers.top$avg_log2FC = signif(so.ab.markers.top$avg_log2FC, digits=2)
+so.ab.markers.top$p_val_adj = signif(so.ab.markers.top$p_val_adj, digits=2)
+DotPlot(so, features=unique(so.ab.markers.top$gene), scale.by='size') + scico::scale_color_scico(palette = "vik") + RotatedAxis()
+datatable(so.ab.markers.top, filter='top', extensions = 'Buttons', options = list(dom = 'Bfrtip', buttons = c('copy', 'csv', 'excel', 'pdf', 'print')))
+```
+
+
+#### Feature and violin plots of top surface markers
+```{r, fig.width=13, fig.height=11, warning=F}
+FeaturePlot(so, features=unique(so.ab.markers.top$gene), reduction='iWUMAP')
+# VlnPlot(so, features=unique(so.ab.markers.top$gene), pt.size=.05, assay='iAB')
+```
+
+
+### Per cluster relative cell abundance and differential gene expression
+```{r, results='asis', message=F, warning=F}
+testMarkers = function(so.sub, var, first, second, plot=T) {
+   so.c.cells = table(so.sub@meta.data$Sample_Name)
+   Idents(so.sub) = so.sub@meta.data[[var]]
+   if(length(table(Idents(so.sub)))==1 | any(table(Idents(so.sub))[c(first, second)]<3)) { cat(paste(c('\nless than 3 cells per condition\n'))); return() }
+   
+   so.c.cells = table(so.sub@meta.data$Sample_Name)
+   so.c.mark = FindMarkers(so.sub, test.use="MAST", ident.1=first, ident.2=second, assay='RNA', verbose=F, min.pct=0.1)
+   so.c.mark = subset(so.c.mark, p_val_adj<0.1 & abs(avg_log2FC)>0.1)
+   if(nrow(so.c.mark)<1) { cat(paste(c('\nno significant genes for', first, 'vs', second,'\n'))); return();}
+   
+   l2fc = so.c.mark[,"avg_log2FC", drop=F]
+   padj = so.c.mark[,"p_val_adj", drop=F]
+   padj = ifelse(padj<0.001,"***",ifelse(padj<0.01,"**",ifelse(padj<0.05,"*","")))
+
+   p1 = Heatmap(l2fc, name="l2FC", column_gap=unit(0, "mm"), border=T, column_names_gp=gpar(fontsize=10),
+                row_names_gp=gpar(fontsize=10), column_title_gp=gpar(fontsize=8), row_title_rot=0, 
+                cluster_rows=T, cluster_columns=F, show_heatmap_legend=F,
+                cell_fun=function(j, i, x, y, w, h, fill) { grid.text(paste0(signif(l2fc[i,j], 2), " ", padj[i,j]), x, y, gp=gpar(fontsize=7)) },
+                col=colorRamp2(c(-2, 0, 2), c("#3344aa", "#eeeeee", "#aa4444")))
+
+   pct = so.c.mark[,c("pct.1", "pct.2"), drop=F]
+   colnames(pct) = c(first, second)
+
+   p2 = Heatmap(as.matrix(pct), name="pct", column_names_gp=gpar(fontsize=10),
+                row_names_gp=gpar(fontsize=12), column_title_gp=gpar(fontsize=8), column_gap=unit(0, "mm"),
+                cluster_rows=T, cluster_columns=F, row_title_rot=0, border=T, show_heatmap_legend=F,
+                cell_fun=function(j, i, x, y, w, h, fill) { grid.text(signif(pct[i, j], 2), x, y, gp=gpar(fontsize=10)) },
+                col=colorRamp2(c(0, 1), c("#ffffff", "#555555")))
+   
+   avg_expr = AverageExpression(so.sub, return.seurat=F, assays="RNA", group.by="Sample_Name", slot="data", verbose=F)[[1]][rownames(so.c.mark), , drop=F]
+   avg_expr = avg_expr/rowSums(avg_expr, na.rm=T)*100
+
+   p3 = Heatmap(as.matrix(avg_expr), name="mean(exp)", row_km=2, row_names_gp=gpar(fontsize=10),
+                cluster_rows=T, cluster_columns=F, show_heatmap_legend=F, column_names_gp=gpar(fontsize=10),
+                column_title_gp=gpar(fontsize=8), column_gap=unit(0, "mm"), row_title_rot=0, border=T,
+                cell_fun=function(j, i, x, y, w, h, fill) { grid.text(paste(round(avg_expr[i, j], 1), '%'), x, y, gp=gpar(fontsize=10)) },
+                top_annotation=columnAnnotation(cells=anno_barplot(unlist(list(so.c.cells)), height=unit(10, "mm"), border=F, add_numbers=T, gp=gpar(fill="#CCCCCC", col='white'))),
+                col=colorRamp2(c(0, max(avg_expr)), c("#ffffff", "#44aa55")))
+   
+   if(plot) {subchunkify(p1+p2+p3, fig_height=nrow(avg_expr)/5+2, fig_width=8)}
+   so.c.mark
+}
+
+c.count = table(so@meta.data$Sample_Name, so@meta.data$cluster)
+perc = c.count / rowSums(c.count) * 100
+for(cl in levels(so@meta.data$cluster_orig)) {
+   cat(paste(c('\n\n#### Cluster', cl, '\n')))
+   so.tmp = so
+   so.tmp@meta.data$cluster = factor(ifelse(so.tmp@meta.data$cluster_orig==cl, cl, 'other'))
+   subchunkify(DimPlot(so.tmp, reduction="iWUMAP", group.by="cluster", label=T, label.size=3, repel=T), fig_height=5, fig_width=5)
+   so.c = subset(so, cluster_orig==cl)
+   c.perc = data.frame(meta, percent=perc[as.character(meta$Sample_Name), cl])
+   c.perc.extra = rbind(c.perc, within(subset(c.perc, Health=='HC'), Health<-'BP'), within(subset(c.perc, Health=='HC'), Health<-'PV'), within(subset(c.perc, Health=='HC'), Health<-'PSORI'))
+      subchunkify(datatable(compare_means(percent ~ Lesion, c.perc.extra, group.by='Health', method='t.test')[,c('Health', 'group1', 'group2', 'p.adj', 'p.format', 'method')]), fig_height=5, fig_width=5, warning=F)
+   
+   p1 = ggplot(c.perc, aes(x=Health, y=percent, fill=Lesion)) +
+            geom_boxplot(position=position_dodge()) +
+            stat_compare_means(aes(group = Origin), label="p.signif") +
+            theme_classic()
+   # c.stat = c.perc %>% t_test(percent ~ Health, ref.group='HC') %>% add_xy_position(x = "Health", dodge = 0.8)
+   c.perc <- c.perc %>% group_by(Origin) %>% summarise(se=sd(percent, na.rm = TRUE)/sqrt(length(percent)), avg=mean(percent), Health=Health[1], Lesion=Lesion[1])
+   p2 = ggplot(c.perc, aes(x=Health, y=avg, fill=Lesion)) + geom_bar(stat="identity", position=position_dodge()) +
+      ylab('cells per sample [%]') +
+            geom_errorbar(aes(ymin=avg-se, ymax=avg+se), width=.2, position=position_dodge(.9)) + theme_classic()# +
+            # stat_pvalue_manual(c.stat, label = "p.adj", tip.length = 0.01, bracket.nudge.y = -2))
+   subchunkify(p1+p2, fig_height=3, fig_width=9)
+   
+   for(cond in levels(factor(so@meta.data$Health))) {
+      if(cond == 'HC') {next;}
+      cat(paste(c('\n\n#####', cond, '\n')))
+      
+      so.sub = subset(so, cluster==cl & Health %in% cond)
+      testMarkers(so.sub, 'Lesion', 'lesional', 'perilesional')
+         
+      for(site in levels(factor(so@meta.data$Lesion))) {
+         if(site == 'healthy') {next;}
+         cat(paste(c('\n\n######', site, '\n')))
+         so.sub = subset(so, cluster==cl & Health %in% c(cond, 'HC') & Lesion %in% c(site, 'healthy'))
+         testMarkers(so.sub, 'Lesion', site, 'healthy')
+      }
+      
+   }
+}
+# cat('\n\n### Cluster 1 vs 3\n')
+# d = round(testMarkers(so, 'cluster_orig', 1, 3, F)[, c('avg_log2FC', 'p_val_adj')], digits=3)
+# d$gene = row.names(d); d$signif = cut(d$p_val_adj, breaks=c(-Inf, 0.001, 0.01, 0.05, 0.10, Inf), labels=c("***", "**", "*", ".", "n.s."), right=F)
+# datatable(d, filter='top', extensions='Buttons', options=list(dom='Bfrtip', buttons=c('copy', 'csv', 'excel', 'pdf', 'print')))
+# 
+# cat('\n\n### Cluster 1 vs 0\n')
+# d = round(testMarkers(so, 'cluster_orig', 1, 0, F)[, c('avg_log2FC', 'p_val_adj')], digits=3)
+# d$gene = row.names(d); d$signif = cut(d$p_val_adj, breaks=c(-Inf, 0.001, 0.01, 0.05, 0.10, Inf), labels=c("***", "**", "*", ".", "n.s."), right=F)
+# datatable(d, filter='top', extensions='Buttons', options=list(dom='Bfrtip', buttons=c('copy', 'csv', 'excel', 'pdf', 'print')))
+# 
+# cat('\n\n### Cluster 1 vs 2\n')
+# d = round(testMarkers(so, 'cluster_orig', 1, 2, F)[, c('avg_log2FC', 'p_val_adj')], digits=3)
+# d$gene = row.names(d); d$signif = cut(d$p_val_adj, breaks=c(-Inf, 0.001, 0.01, 0.05, 0.10, Inf), labels=c("***", "**", "*", ".", "n.s."), right=F)
+# datatable(d, filter='top', extensions='Buttons', options=list(dom='Bfrtip', buttons=c('copy', 'csv', 'excel', 'pdf', 'print')))
+# 
+# cat('\n\n### Cluster 2 vs 0\n')
+# d = round(testMarkers(so, 'cluster_orig', 2, 0, F)[, c('avg_log2FC', 'p_val_adj')], digits=3)
+# d$gene = row.names(d); d$signif = cut(d$p_val_adj, breaks=c(-Inf, 0.001, 0.01, 0.05, 0.10, Inf), labels=c("***", "**", "*", ".", "n.s."), right=F)
+# datatable(d, filter='top', extensions='Buttons', options=list(dom='Bfrtip', buttons=c('copy', 'csv', 'excel', 'pdf', 'print')))
+```
+
+## Specific cell populations
+```{r cell_pop_xtabs, message=F, warning=F}
+table(so@meta.data$Health, so@meta.data$manual_NK) %>% kbl() %>% kable_classic(full_width=F)
+table(so@meta.data$refNK, so@meta.data$manual_NK) %>% kbl() %>% kable_classic(full_width=F)
+table(so@meta.data$Health, so@meta.data$manual_ILC) %>% kbl() %>% kable_classic(full_width=F)
+```
+
+```{r specific_cells, results='asis', message=F, warning=F}
+cell_classes = c('manual_NK', 'manual_ILC')
+for(cl in cell_classes) {
+   subchunkify(DimPlot(so, reduction="iWUMAP", group.by=cl, label=T, label.size=3, repel=T), fig_height=5, fig_width=5, warning=F)
+   
+   c.count = table(so@meta.data$Sample_Name, so@meta.data[[cl]])
+   perc = c.count / rowSums(c.count) * 100
+   for(t in levels(so@meta.data[[cl]])) {
+      cat(paste(c('\n\n### Cell Type', t, '\n')))
+      so.c = so
+      so.c@meta.data$selected <- so@meta.data[[cl]]
+      so.c = subset(so.c, selected==t)
+      c.perc = data.frame(meta, percent=perc[as.character(meta$Sample_Name), as.character(t)])
+      c.perc.extra = rbind(c.perc, within(subset(c.perc, Health=='HC'), Health<-'BP'), within(subset(c.perc, Health=='HC'), Health<-'PV'), within(subset(c.perc, Health=='HC'), Health<-'PSORI'))
+      subchunkify(datatable(compare_means(percent ~ Lesion, c.perc.extra, group.by='Health', method='t.test')[,c('Health', 'group1', 'group2', 'p.adj', 'p.format', 'method')]), fig_height=5, fig_width=5, warning=F)
+   
+      p1 = ggplot(c.perc, aes(x=Health, y=percent, fill=Lesion)) +
+            geom_boxplot(position=position_dodge()) +
+            stat_compare_means(aes(group = Origin), label="p.signif") +
+            theme_classic()
+      # c.stat = c.perc %>% t_test(percent ~ Health, ref.group='HC') %>% add_xy_position(x = "Health", dodge = 0.8)
+      c.perc <- c.perc %>% group_by(Origin) %>% summarise(sd=sd(percent, na.rm = TRUE), avg=mean(percent), Health=Health[1], Lesion=Lesion[1])
+      p2 = ggplot(c.perc, aes(x=Health, y=avg, fill=Lesion)) + geom_bar(stat="identity", position=position_dodge()) +
+            geom_errorbar(aes(ymin=avg-sd, ymax=avg+sd), width=.2, position=position_dodge(.9)) + theme_classic()# +
+            # stat_pvalue_manual(c.stat, label = "p.adj", tip.length = 0.01, bracket.nudge.y = -2))
+      cat("\n")
+      subchunkify(p1+p2, fig_height=3, fig_width=7)
+      cat("\n")
+   
+      for(cond in levels(factor(so@meta.data$Health))) {
+         if(cond == 'HC') {next;}
+         cat(paste(c('\n\n####', cond, '\n')))
+         
+         so.sub = subset(so.c, Health %in% cond)
+         testMarkers(so.sub, 'Lesion', 'lesional', 'perilesional')
+            
+         for(site in levels(factor(so@meta.data$Lesion))) {
+            if(site == 'healthy') {next;}
+            cat(paste(c('\n\n#####', site, '\n')))
+            so.sub = subset(so.c, Health %in% c(cond, 'HC') & Lesion %in% c(site, 'healthy'))
+            testMarkers(so.sub, 'Lesion', site, 'healthy')
+         }
+         
+      }
+   }
+}
+```
+
+## NK cells
+### Comparison of cluster 1 and 3 cells
+#### manually annotated
+```{r nk_manu, results='asis', message=F, warning=F, fig.width=13, fig.height=30}
+so.sub = subset(so, manual_NK=='NK')
+datatable(testMarkers(so.sub, 'cluster_orig', 1, 3, F))
+```
+
+#### reference annotation
+```{r nk_ref, results='asis', message=F, warning=F, fig.width=13, fig.height=30}
+so.sub = subset(so, refNK=='NK')
+datatable(testMarkers(so.sub, 'cluster_orig', 1, 3, F))
+```
+
+## pseudo bulk RNA-Seq analysis
+```{r bulk}
+plot.DE = function(deseq.res, min.lfc=0, max.pval=0.05, lim.pval=0, lim.lfc=c(-Inf, Inf), label.names=c(''), col.insign='#99999999', col.up='gold', col.down='dodgerblue4', main='') {
+   if(length(min.lfc)==1) min.lfc=c(-min.lfc, min.lfc)
+   if(lim.lfc[1]==-Inf) lim.lfc[1] = min(deseq.res$log2FoldChange)
+   if(lim.lfc[2]==Inf) lim.lfc[2] = max(deseq.res$log2FoldChange)
+   deseq.res$sym = 'unchanged'
+   deseq.res = within(deseq.res, {
+      reg = factor(rep('insign', nrow(deseq.res)), levels=c('down', 'insign', 'up'))
+      reg[padj <= max.pval & log2FoldChange <= min.lfc[1]] = 'down'
+      reg[padj <= max.pval & log2FoldChange >= min.lfc[2]] = 'up'
+      if(is.logical(label.names)) {
+         if(label.names) {
+            Gene[reg=='insign'] = NA
+         } else {
+            Gene = NA
+         }
+      } else {
+         Gene[!Gene %in% label.names] = NA
+      }
+      sym[log2FoldChange < lim.lfc[1]] = 'left'
+      sym[log2FoldChange > lim.lfc[2]] = 'right'
+      sym[padj < lim.pval] = 'top'
+      sym[padj < lim.pval & log2FoldChange < lim.lfc[1]] = 'topleft'
+      sym[padj < lim.pval & log2FoldChange > lim.lfc[2]] = 'topright'
+      log2FoldChange[log2FoldChange < lim.lfc[1]] = lim.lfc[1]
+      log2FoldChange[log2FoldChange > lim.lfc[2]] = lim.lfc[2]
+      padj[padj < lim.pval] = lim.pval
+   })
+   lab = data.frame(x=lim.lfc, y=c(1, 1), label=as.character(c(sum(deseq.res$reg=='down'), sum(deseq.res$reg=='up'))), reg=c('down', 'up'))
+   return(ggplot(data=deseq.res, aes(x=log2FoldChange, y=-log10(padj), col=reg, label=Gene, shape=factor(sym))) +
+      geom_point(size=2) + 
+      theme_classic() +
+      geom_text_repel(data=deseq.res, aes(x=log2FoldChange, y=-log10(padj), label=Gene), point.size=3, show.legend=F, na.rm=T, size=3, point.padding=0.2, box.padding=1, segment.curvature=-1e-20, max.overlaps=Inf,
+                          force=1.5, force_pull=0.4, segment.size=0.1, min.segment.length=unit(0, 'lines'), nudge_x=ifelse(deseq.res$reg=='down', -1, 1), nudge_y=ifelse(deseq.res$reg=='insign', -0.1, .1)) +
+      annotate(geom='text', x=lim.lfc, y=c(0,0), label=c(sum(deseq.res$reg=='down'), sum(deseq.res$reg=='up')), col=c(col.down, col.up)) +
+      scale_color_manual(values=list(up=col.up, down=col.down, insign=col.insign)) +
+      scale_y_continuous(expand=c(0,0.1)) +
+      scale_shape_manual(values=c("unchanged"="\u25CF", "top"="\u25B2", "left"="\u25C0", "right"="\u25B6", "topleft"="\u25E4", "topright"="\u25E5"), guide='none') +
+      ggtitle(main) +
+      geom_vline(xintercept=min.lfc, lty=2, color=col.insign) +
+      geom_hline(yintercept=-log10(max.pval), lty=2, color=col.insign))
+      
+}
+
+
+pcaplot <- function(dds, ntop=500, fill, shape, title='') {
+  pca <- prcomp(t(assay(dds)[order(rowVars(assay(dds)), decreasing = TRUE)[1:min(ntop, nrow(assay(dds)))], ]))
+  percentVar <- pca$sdev^2/sum(pca$sdev^2)
+  d = data.frame(PC1=pca$x[,'PC1'], PC2=pca$x[,'PC2'])
+  d[[fill]]=factor(dds[[fill]])
+  d[[shape]]=factor(dds[[shape]])
+  ggplot(d) + geom_point(aes_string(x='PC1', y='PC2', color=fill, shape=shape)) + xlab(paste0("PC1: ", round(percentVar[1] * 100, digits = 2), "% variance")) +  ylab(paste0("PC2: ", round(percentVar[2]*100, digits=2), "% variance"))
+}
+
+DefaultAssay(so) = 'RNA'
+bulk <- Seurat:::PseudobulkExpression(so, pb.method='aggregate', slot='counts', group.by='Sample_Name', return.seurat=F)[['RNA']]
+
+sel = meta$Health=='PV' & (!meta$Sample_Name %in% c('PV3_peri', 'PV4_les'))
+# bulk = apply(bulk, 1, as.integer)
+# storage.mode(bulk) = 'integer'
+dds = DESeqDataSetFromMatrix(round(bulk[,sel]), colData=meta[sel,], design=~Lesion)
+dds = DESeq(dds)
+res = results(dds, contrast=c('Lesion', 'perilesional', 'lesional'))
+res$Gene = row.names(res)
+
+pcaplot(dds, fill='Lesion', shape='Replicate')
+plot.DE(as.data.frame(res), lim.lfc=c(-2,2), label.names=T)
+
+```

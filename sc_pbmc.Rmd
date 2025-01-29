@@ -1,0 +1,469 @@
+---
+title: "PBMC multi-modal reference mapping"
+always_allow_html: yes
+date: "Compiled `r Sys.Date()`"
+output:
+  html_document:
+    toc: yes
+    toc_float: yes
+    toc_depth: 5
+    theme: united
+    code_folding: hide
+    collapse: yes
+    css: max.css
+---
+
+[BACK TO INDEX](./index.html)
+
+```{r, message=F, warning=F}
+set.seed(123)
+knitr::opts_knit$set(progress=F, verbose=F, warning=F, message=F)
+
+library(Seurat)
+library(tidyverse)
+library(DT)
+library(data.table)
+library(ggplot2)
+library(SeuratDisk)
+library(ggpubr)
+library(rstatix)
+library(celda)
+library(viridis)
+library(ComplexHeatmap)
+library(circlize)
+library(ggvenn)
+# library(RColorBrewer)
+
+library(future)
+plan("multicore", workers=18)
+
+dontshow <- sapply(c("dplyr","Seurat", "HGNChelper", "openxlsx"), library, character.only=T, quietly=T)
+source("gene_sets_prepare.R"); source("sctype_score_.R"); source("auto_detect_tissue_type.R")
+source("aux.R")
+```
+
+# Blood (PBMC)
+
+## Meta data information
+```{r}
+meta = read.csv('meta2.csv', sep='\t', header=T, stringsAsFactors=T)
+meta$Health = factor(meta$Health, levels=c('HC', 'PV', 'PSORI', 'BP'), labels=c('HC', 'PV', 'PSORI', 'BP'))
+meta = subset(meta, Tissue=='pbmc')
+datatable(meta)
+meta$PVvsHC = factor(ifelse(meta$Health %in% c('PV', 'HC'), as.character(meta$Health), NA), levels=c('PV', 'HC'))
+meta$BPvsHC = factor(ifelse(meta$Health %in% c('BP', 'HC'), as.character(meta$Health), NA), levels=c('BP', 'HC'))
+meta$PSORIvsHC = factor(ifelse(meta$Health %in% c('PSORI', 'HC'), as.character(meta$Health), NA), levels=c('PSORI', 'HC'))
+```
+
+
+```{r warning=F}
+counts = fread("data/Combined_S3-forced-pbmc_DBEC_MolsPerCell.csv", sep=",", header=TRUE) %>% data.frame(row.names=1)
+ex3 = readRDS('archive/Ex3-wta_Seurat.rds')
+ggvenn(list(s3=rownames(counts), ex3=rownames(ex3@meta.data)), auto_scale=T)
+genes = !grepl("pAbO", names(counts)) # select only gene columns
+num_rna = sum(genes==T)
+num_ab = sum(genes==F)
+counts = counts %>% dplyr::rename(VSIR=C10orf54, SCYL1=CCL13, IGHA1=IGHA1_secreted, IGHD=IGHD_membrane,
+                  IGHA1=IGHA1_secreted, IGHG1=IGHG1_secreted, IGHG2=IGHG2_secreted,
+                  IGHG3=IGHG3_secreted, IGHG4=IGHG4_secreted, IGHM=IGHM_secreted,
+                  TRGC1=TARP_refseq, FYB1=FYB, `HLA-A`=HLA.A, `HLA-DMA`=HLA.DMA,
+                  `HLA-DPA1`=HLA.DPA1, `HLA-DQB1`=HLA.DQB1, `HLA-DRA`=HLA.DRA,
+                  `HLA-DR`=HLA.DR.CD74.AHS0035.pAbO, `CD56-1`=CD56.NCAM16.2.NCAM1.AHS0019.pAbO,
+                  CD185=CXCR5.CXCR5.AHS0039.pAbO, CD186=CXCR6.CXCR6.AHS0148.pAbO,
+                  CD357=GITR.TNFRSF18.AHS0104.pAbO, CD366=Tim3.HAVCR2.AHS0016.pAbO,
+                  `CD4-1.pAb0`=CD4.SK3.CD4.AHS0032.pAbO, `CD3-1.pAb0`=CD3.UCHT1.CD3E.AHS0231.pAbO)
+names(counts)[!genes] = gsub('\\..*$', '', names(counts)[!genes]) # rename antibody columns
+
+counts = counts[order(row.names(counts)),]
+pbmc <- CreateSeuratObject(counts=t(counts[,genes]), assay="RNA", project='pbmc')
+pbmc[['AB']] = CreateAssayObject(counts=t(counts[,!genes]))
+rm(counts)
+
+# original sample calls for each cell
+cell_assign <- fread("data/S3-forced-pbmc_Sample_Tag_Calls.csv", sep=",", header=TRUE) %>% data.frame(row.names=1)
+cell_assign = cell_assign[order(row.names(cell_assign)),]
+
+# Reads of each sample per cell
+cell_sample_reads <- fread("data/S3-forced-pbmc_Sample_Tag_ReadsPerCell.csv", sep=",", header=TRUE) %>% data.frame(row.names=1)
+cell_sample_reads = cell_sample_reads[order(row.names(cell_sample_reads)),]
+names(cell_sample_reads) = gsub('\\.stAbO', '', names(cell_sample_reads))
+
+stopifnot(identical(row.names(cell_assign), row.names(cell_sample_reads)))
+
+cell_sample_recalls = data.frame(col=apply(cell_sample_reads, 1, function(r) { which.max(r) }), og_tag=cell_assign$Sample_Tag, og_sample=cell_assign$Sample_Name)
+# cell_sample_recalls$Sample_Tag = cell_assign$Sample_Tag
+cell_sample_recalls$Sample_Tag = names(cell_sample_reads)[cell_sample_recalls$col]
+cell_sample_recalls$ratio = apply((cell_sample_reads+1)/colSums(cell_sample_reads), 1, function(r) max(r)/sum(r)) # normalized by total of each sample tag
+cell_sample_recalls$Max_Tag_Reads = apply(cell_sample_reads, 1, max)
+
+cell_sample_recalls = merge(cell_sample_recalls, meta, by='Sample_Tag', all.x=T)
+row.names(cell_sample_recalls) = row.names(cell_assign)
+cell_sample_recalls$multiplet = factor(ifelse(cell_sample_recalls$og_sample=='Multiplet', 'multiplet', ifelse(cell_sample_recalls$og_sample=='Undetermined', 'undetermined', 'unique')))
+pbmc <- AddMetaData(pbmc, metadata=cell_sample_recalls)
+# pbmc = subset(pbmc, !Sample_Name %in% c('Multiplet', 'Undetermined'))
+rm(cell_sample_recalls); rm(cell_sample_reads); rm(cell_assign)
+
+
+counts <- LayerData(pbmc, assay = "RNA", layer = "counts")
+counts <- Matrix::t(Matrix::t(counts)/Matrix::colSums(counts)) * 100
+most_expressed <- order(apply(counts, 1, median), decreasing = T)[10:1]
+boxplot(as.matrix(t(counts[most_expressed, ])), cex = 0.1, las = 1, xlab = "% total count per cell",
+    col = rainbow(length(most_expressed)), horizontal=T, main='top transcripts')
+
+counts <- LayerData(pbmc, assay = "AB", layer = "counts")
+counts <- Matrix::t(Matrix::t(counts)/Matrix::colSums(counts)) * 100
+most_expressed <- order(apply(counts, 1, median), decreasing = T)[10:1]
+boxplot(as.matrix(t(counts[most_expressed, ])), cex = 0.1, las = 1, xlab = "% total count per cell",
+    col = rainbow(length(most_expressed)), horizontal=T, main='top surface markers')
+
+pbmc@meta.data$Health = factor(pbmc@meta.data$Health, levels=c('HC', 'PV', 'PSORI', 'BP'), labels=c('HC', 'PV', 'PSORI', 'BP'))
+```
+
+
+## Data quality
+Ideally, cells should have a large number of reads overall (x-axis) and fairly broad coverage of a large number of genes (y-axis).
+Cells with few detected genes (bottom) make normalization and imputation hard to impossible.
+We can use minimal thresholds (red dashed lines) for number of genes and number of overall reads to exclude low quality cells.
+```{r, fig.width=9, fig.height=9, warning=F}
+feature_min = 10
+read_min = 10
+ratio_min = 0.5
+ggplot(pbmc@meta.data, aes(x=nCount_RNA, y=nFeature_RNA, color=multiplet, alpha=ratio)) + 
+  geom_point(shape=16, size=1) + scale_color_manual(values=list(undetermined='orange', multiplet='red', unique='navy')) +
+  scale_alpha(range=c(0.8, 0.1)) + scale_x_log10()  + theme_classic() +
+  geom_hline(yintercept=feature_min, color='red', lty='dashed') +
+  geom_vline(xintercept=read_min, color='red', lty='dashed') +
+  facet_wrap(~Sample_Name, ncol=3)
+```
+
+Notably, multiplets are scattered throughout the distribution.
+I assume uniquely identified cells also just contain reads from one sample tags, whereas remaining multiplets count reads from two or more tags that we cannot disentangle at this point.
+
+```{r, fig.width=11, fig.height=5}
+ggplot(pbmc@meta.data, aes(color=Sample_Name, x=nCount_RNA, fill=Sample_Name)) +
+   geom_density(alpha=0.2) + scale_x_log10() + theme_classic() +
+   geom_vline(xintercept=read_min, color='red', lty='dashed') + facet_wrap(~multiplet, ncol=1) +
+   labs(title='UMI counts per cell', y='cell density') + scale_y_continuous(expand=c(0,0)) +
+
+   ggplot(pbmc@meta.data, aes(color=Sample_Name, x=nFeature_RNA, fill=Sample_Name)) +
+   geom_density(alpha=0.2) + scale_x_log10() + theme_classic() +
+   labs(y="Cell density", title='Genes per cell') + facet_wrap(~multiplet, ncol=1) +
+   geom_vline(xintercept=feature_min, color='red', lty='dashed') + scale_y_continuous(expand=c(0,0)) + theme(legend.position='none')
+```
+
+
+### Multiplet analysis
+Based on the most prominent sample tag per cell, multiplets could be "rescued".
+When plotting the ratio of the most prominent sample tag among all reads, we see that most multiplets are dominated by one tag.
+```{r, fig.width=11, fig.height=5, warning=F}
+ggplot(subset(pbmc@meta.data, multiplet!='undetermined'), aes(x=nCount_RNA, y=ratio, color=factor(Replicate)), alpha=0.1) +
+  geom_point(shape=16, size=1) +
+  scale_x_log10() + theme_classic() +
+  geom_vline(xintercept=read_min, color='red', lty='dashed') +
+   geom_hline(yintercept=ratio_min, color='red', lty='dashed') +
+  facet_grid(vars(multiplet), vars(Health))
+```
+
+Including cells with at least the absolute majority of one sample (50% of tags) seems feasible but poses the risk of introducing "heterogenous" (more variable) cells to the analysis and muddling the clustering.
+Note that some of the uniquely identified cells also contain more than 50% other sample tags.
+
+⚠ Due to sufficiently high cell numbers in the PBMC samples overall, we decided to not recover multiplet in this dataset!
+
+```{r, fig.width=11, fig.height=5}
+p1 = ggplot(pbmc@meta.data, aes(x=factor(Sample_Name), fill=Sample_Name, alpha=multiplet)) + scale_alpha_ordinal(range=c(0.2, 1)) +
+   geom_bar(show.legend=F) + coord_flip() + labs(y='# cells', x='', title='Cells per sample (+ multiplet rescue)') + theme_classic() + scale_y_continuous(expand=c(0.002, 0.002))
+
+p2 = ggplot(subset(pbmc@meta.data, multiplet!='unique'), aes(x=og_sample, alpha=multiplet)) + scale_alpha_ordinal(range=c(0.8, 0.9))+
+   geom_bar(aes(fill=Sample_Name), show.legend=F) + labs(y='# cells', x='', title='Cells per sample') + theme_classic() + scale_y_continuous(expand=c(0.002, 0.002)) + theme(legend.title=element_text(size=11), legend.key.height=unit(4, 'mm'), legend.key.width=unit(8, 'mm'))
+
+ggarrange(p1, p2, widths=c(3,1))
+```
+
+## Multimodal UMAP
+```{r, echo=F, warning=F, message=F}
+# pbmc@meta.data$Sample_Name = pbmc@meta.data$og_Sample
+pbmc <- subset(pbmc, subset=nFeature_RNA >= feature_min & nCount_RNA >= read_min & multiplet=='unique')# & ABcontamination < 0.75) #ratio > 0.5  & pbmc$multiplet=='unique'
+
+DefaultAssay(pbmc) <- "RNA"
+pbmc = pbmc %>%
+   NormalizeData(verbose=F) %>%
+   FindVariableFeatures(verbose=F) %>%
+   ScaleData() %>%
+   RunPCA(reduction.name='rna.pca', reduction.key="rnaPC_", npcs=35, approx=F, verbose=F)
+
+DefaultAssay(pbmc) <- "AB"
+pbmc = pbmc %>%
+   NormalizeData(normalization.method="CLR", margin=2, verbose=F) %>%
+   FindVariableFeatures(verbose=F) %>%
+   ScaleData() %>%
+   RunPCA(reduction.name='ab.pca', reduction.key="abPC_", npcs=25, approx=F, verbose=F)
+
+pbmc = pbmc %>%
+   FindNeighbors(reduction='ab.pca', dims=1:20, graph.name=c('ab.nn', 'ab.snn'), do.plot=T, verbose=F) %>%
+   FindClusters(graph.name="ab.snn", algorithm=3, resolution=0.3, verbose=F) %>%
+   RunUMAP(reduction='ab.pca', assay='AB', dims=1:20, reduction.name="AB.umap", verbose=F, reduction.key='umap') %>%
+   FindNeighbors(reduction='rna.pca', dims=1:30, graph.name=c('rna.nn', 'rna.snn'), do.plot=T, verbose=F) %>%
+   FindClusters(graph.name="rna.snn", algorithm=3, resolution=0.3, verbose=F) %>%
+   RunUMAP(reduction='rna.pca', assay='RNA', dims=1:30, reduction.name="RNA.umap", verbose=F, reduction.key='umap') %>%
+   FindMultiModalNeighbors(reduction.list=list("rna.pca", "ab.pca"), dims.list=list(1:35, 1:20),
+                            knn.graph.name="wknn", snn.graph.name="wsnn", weighted.nn.name='w.nn', verbose=F) %>%
+   FindClusters(graph.name="wsnn", algorithm=3, resolution=0.07, verbose=F) %>%
+   RunUMAP(reduction.name="wUMAP", verbose=F, nn.name="w.nn", reduction.key='umap')
+
+pbmc@meta.data$cluster = pbmc@meta.data$wsnn_res.0.07
+DimPlot(pbmc, reduction = "wUMAP", group.by='cluster')
+
+pbmc <- pbmc %>% FindSubCluster(cluster='2', subcluster.name='subclust2', resolution=0.35, algorithm=3, graph.name="wknn") %>%
+   FindSubCluster(cluster='0', subcluster.name='subclust0', resolution=0.35, algorithm=3, graph.name="wknn")
+# DimPlot(pbmc, reduction = "wUMAP", group.by='subclust0')
+pbmc@meta.data$subcluster = as.character(pbmc@meta.data$wsnn_res.0.07)
+pbmc@meta.data$subcluster[pbmc@meta.data$subcluster=='2'] = pbmc@meta.data$subclust2[pbmc@meta.data$subcluster=='2']
+pbmc@meta.data$subcluster[pbmc@meta.data$subcluster=='0'] = pbmc@meta.data$subclust0[pbmc@meta.data$subcluster=='0']
+pbmc@meta.data$subcluster = factor(pbmc@meta.data$subcluster)
+pbmc@meta.data$cluster_orig = pbmc@meta.data$cluster
+# pbmc@meta.data$cluster = pbmc@meta.data$subcluster
+# Idents(pbmc) = pbmc@meta.data$cluster
+# svg('sc_pbmc_umap_subcluster.svg')
+# DimPlot(pbmc, reduction = "wUMAP", group.by='subclust2')
+# dev.off()
+
+DimPlot(subset(pbmc, cluster_orig==2), reduction="wUMAP", group.by='subcluster')
+```
+
+## Reference mapping
+### To published skin rash data
+[RashX article](https://doi.org/10.1126/sciimmunol.abl9165)
+
+```{r, include=T, eval=T, warning=F, message=F}
+ref.skin <- readRDS("reference/SI_Bangert.rds")
+ref.skin = Seurat::UpdateSeuratObject(ref.skin)
+# DimPlot(ref.skin, reduction="umap", group.by="Ident2", label=T, label.size=3, repel=T, raster=F) + NoLegend()
+genes = row.names(LayerData(pbmc, assay="RNA"))
+ABs = row.names(LayerData(pbmc, assay="AB"))
+ref.skin.genes = row.names(LayerData(ref.skin, assay="RNA"))
+ref.skin.ABs = row.names(LayerData(ref.skin, assay="ADT"))
+```
+
+```{r, include=T, eval=T, warning=F, message=F}
+pbmc = SCTransform(pbmc, verbose=F)
+ref.skin = SCTransform(ref.skin, verbose=F)
+anchors <- FindTransferAnchors(reference=ref.skin, query=pbmc, normalization.method="SCT",
+                               reference.reduction="spca", dims=1:50, verbose=T)
+pbmc <- MapQuery(anchorset=anchors, query=pbmc, reference=ref.skin, new.reduction.name='ref.skin.umap',
+               refdata=list(skin="Ident2"), reference.reduction="spca", reduction.model="umap", verbose=F)
+DimPlot(pbmc, reduction="wUMAP", group.by="predicted.skin", label=T, label.size=3, repel=T, shuffle=T, alpha=0.5)
+rm(ref.skin); gc()
+
+### Cell type composition based on reference mapping
+ggplot(pbmc@meta.data, aes(x=Sample_Name, fill=predicted.skin)) + geom_bar(position='fill') + 
+   facet_grid(rows=vars(Health), labeller = label_wrap_gen(width=16, multi_line=F), scales="free", space="free") +
+   theme_classic() + coord_flip()
+```
+
+### scType classification
+```{r, fig.width=11, fig.height=8, warning=F, message=F}
+# get cell-type-specific gene sets from our in-built database (DB)
+db_ = "reference/ScTypeDB_full.xlsx"
+gs_list = gene_sets_prepare(db_, "Immune system") # e.g. Immune system, Pancreas, Liver, Eye, Kidney, Brain, Lung, Adrenal, Heart, Intestine, Muscle, Placenta, Spleen, Stomach, Thymus
+
+es.max = sctype_score(scRNAseqData=LayerData(pbmc, assay="RNA", layer="scale.data"), scaled=T, gs=gs_list$gs_positive, gs2=gs_list$gs_negative)
+pbmc@meta.data$scType = factor(row.names(es.max)[apply(es.max, 2, which.max)], levels=row.names(es.max), ordered=T)
+pbmc@meta.data$scCat = factor(pbmc@meta.data$scType, levels=row.names(es.max), labels=c('B', 'B', 'B', 'B', 'B', 'T', 'T', 'T', 'T', 'T', 'T', 'T', 'T', 'T', 'NK', 'Eso', 'Neutro', 'Baso', 'Mast', 'Mono', 'Mono', 'Mono', 'Macro', 'other', 'other', 'other', 'other', 'other', 'other', 'other', 'other', 'other', 'other'), ordered=T)
+normscale = function(x){(x-min(x))/(max(x)-min(x))}
+pbmc@meta.data$scType.score = normscale(apply(es.max, 2, max))
+pbmc@meta.data$scType.quality = normscale(apply(es.max, 2, function(x){max(x)/abs(sum(x)-max(x))}))
+
+ggplot(pbmc@meta.data, aes(x=Sample_Name, fill=scCat)) + geom_bar(position='fill') + 
+   facet_grid(rows=vars(Health), labeller = label_wrap_gen(width=16, multi_line=F), scales="free", space="free") +
+   theme_classic() + coord_flip()
+```
+
+### To reference PBMC dataset
+[Seurat v4 reference for multimodal PBMC](https://satijalab.org/seurat/articles/multimodal_reference_mapping.html)
+
+[original article](https://doi.org/10.1016/j.cell.2021.04.048)
+
+```{r, include=T, eval=T, warning=F, message=F}
+ref <- LoadH5Seurat("reference/pbmc_multimodal.h5seurat", verbose=F)
+ref@meta.data$celltype = ref@meta.data$celltype.l1
+ref@meta.data$celltype[ref@meta.data$celltype == 'NK'] = ref@meta.data$celltype.l2[ref@meta.data$celltype == 'NK']
+ref@meta.data$celltype[ref@meta.data$celltype.l2 == 'ILC'] = 'ILC'
+
+pbmc.genes = row.names(LayerData(pbmc, assay = "RNA", layer = "counts"))
+pbmc.ABs = row.names(LayerData(pbmc, assay = "AB", layer = "counts"))
+ref.genes = row.names(LayerData(ref, assay = "SCT", layer = "data"))
+ref.ABs = row.names(LayerData(ref, assay = "ADT", layer = "counts"))
+```
+
+
+#### Surface markers missing in the reference data
+```{r}
+pbmc.ABs[!pbmc.ABs %in% ref.ABs]
+```
+
+
+#### Transcripts missing in the reference data
+```{r}
+pbmc.genes[!pbmc.genes %in% ref.genes]
+```
+
+```{r, include=T, eval=T, warning=F, message=F}
+# pbmc = SCTransform(pbmc, verbose=F, assay='RNA')
+ref.anchors <- FindTransferAnchors(reference=ref, query=pbmc, normalization.method="SCT",
+                               reference.reduction="spca", dims=1:50, verbose=F)
+pbmc <- MapQuery(anchorset=ref.anchors, query=pbmc, reference=ref, new.reduction.name='ref.pbmc.umap',
+               refdata=list(pbmc.l1="celltype.l1", pbmc.l2="celltype.l2", pbmc.l3="celltype.l3", pbmc="celltype"),
+               reference.reduction="spca", reduction.model="wnn.umap", verbose=F)
+rm(ref); nopprint = gc(verbose=F)
+DefaultAssay(pbmc) <- 'RNA'
+pbmc[['prediction.score.pbmc.l1']] <- NULL
+pbmc[['prediction.score.pbmc.l2']] <- NULL
+pbmc[['prediction.score.pbmc.l3']] <- NULL
+pbmc[['predicted_ADT']] <- NULL
+```
+
+
+#### Cell type composition based on reference mapping
+```{r, fig.width=13, fig.height=4, warning=F}
+ggplot(pbmc@meta.data, aes(x=Sample_Name, fill=predicted.pbmc)) + geom_bar(position='fill') + 
+   facet_grid(rows=vars(Health), labeller = label_wrap_gen(width=16, multi_line=F), scales="free", space="free") +
+   theme_classic() + coord_flip()
+ggplot(pbmc@meta.data, aes(x=Sample_Name, fill=predicted.pbmc.l1)) + geom_bar(position='fill') + 
+   facet_grid(rows=vars(Health), labeller = label_wrap_gen(width=16, multi_line=F), scales="free", space="free") +
+   theme_classic() + coord_flip()
+ggplot(pbmc@meta.data, aes(x=Sample_Name, fill=predicted.pbmc.l2)) + geom_bar(position='fill') + 
+   facet_grid(rows=vars(Health), labeller = label_wrap_gen(width=16, multi_line=F), scales="free", space="free") +
+   theme_classic() + coord_flip() + scale_fill_manual(values=as.vector(t(cbind(viridis(15), rev(plasma(15))))))
+```
+
+
+## Seurat Clusters
+For further analysis, RNA transcripts and surface markers were normalized, and reduced by PCA individually.
+Afterwards, clusters are computed based on multimodal neighbors and represented by UMAP reduction.
+Almost all features were found to be highly variable.
+The tables show strongest regulated gene and surface marker per cluster (both positive and negative)
+
+
+### UMAP
+```{r, fig.width=7, fig.height=6, warning=F}
+DimPlot(pbmc, reduction="wUMAP", group.by="cluster", label=T, label.size=3, repel=T, shuffle=T, alpha=0.5)
+```
+
+### Sample composition
+Based on multi modal model above.
+```{r, fig.width=9, fig.height=3.5}
+ggplot(pbmc@meta.data, aes(x=Sample_Name, fill=cluster)) + geom_bar(position='fill') + 
+   facet_grid(rows=vars(Health), labeller=label_wrap_gen(width=16, multi_line=F), scales="free", space="free") +
+   theme_classic() + coord_flip()
+```
+
+### Annotation based on References
+Reference mapping of cell types (left) and subtypes (rights) within combined (AB+RNA) Weighted Nearest Neighbor UMAP coordinates in PBMC dataset.
+```{r, fig.width=11, fig.height=5, warning=F}
+p1 = DimPlot(pbmc, reduction="wUMAP", group.by="predicted.pbmc", label=T, label.size=3, repel=T)
+p2 = DimPlot(pbmc, reduction="wUMAP", group.by="predicted.pbmc.l2", label=T, label.size=3 ,repel=T) + NoLegend()
+p1 + p2
+
+DimPlot(pbmc, reduction="wUMAP", group.by="predicted.pbmc.l3", label=T, label.size=3, repel=T)
+```
+
+```{r, fig.width=9, fig.height=5}
+pbmc@meta.data$annotation = factor(pbmc@meta.data$cluster, labels=c('C1 (CD4+ T)', 'C2 (CD8+ T)', 'C3 (NK)', 'C4 (mixed)', 'C5 (B)', 'C6 (MAIT & gdT)', 'C7 (CD14+ Mono & cDC2)', 'C8 (pDC)', 'C9 (CD16+ Mono)'))
+
+ggplot(pbmc@meta.data, aes(x=annotation, fill=predicted.pbmc)) + geom_bar(position='fill') + 
+   theme_classic() + coord_flip()
+
+ggplot(pbmc@meta.data, aes(x=annotation, fill=predicted.skin)) + geom_bar(position='fill') + 
+   theme_classic() + coord_flip()
+
+ggplot(pbmc@meta.data, aes(x=annotation, fill=scCat)) + geom_bar(position='fill') + 
+   theme_classic() + coord_flip()
+
+# tab = with(subset(pbmc@meta.data, cluster_orig==0), table(subclust0, predicted.pbmc.l2))
+# round(tab/rowSums(tab)*100, 2)
+
+pbmc@meta.data$subannotation = factor(pbmc@meta.data$subcluster, labels=c('C1_1 (CD4+ TEM MAIT)', 'C1_2 (CD4+ TCM)', 'C1_3 (CD4+ CD8naive Treg)', 'C1_4 (CD4+ CD8 MAIT)', 'C1_5 (CD4+ gdT)', 'C1_6 (CD4+ mix)', 'C2 (CD8+ T)', 'C3 (NK1)', 'C3 (NK2)', 'C3 (NK3)', 'C3 (NK4)', 'C4 (mixed)', 'C5 (B)', 'C6 (MAIT & gdT)', 'C7 (CD14+ Mono & cDC2)', 'C8 (pDC)', 'C9 (CD16+ Mono)'))
+
+ggplot(subset(pbmc@meta.data, cluster==2), aes(x=subannotation, fill=predicted.pbmc.l3)) + geom_bar(position='fill') + 
+   theme_classic() + coord_flip()
+
+ggplot(subset(pbmc@meta.data, cluster==2), aes(x=subannotation, fill=predicted.skin)) + geom_bar(position='fill') + 
+   theme_classic() + coord_flip()
+
+ggplot(subset(pbmc@meta.data, cluster==2), aes(x=subannotation, fill=scCat)) + geom_bar(position='fill') + 
+   theme_classic() + coord_flip()
+
+
+```
+
+
+## Interactive visualization
+```{r, fig.width=11, fig.height=7}
+d = LayerData(pbmc, assay = "AB", layer = "data")
+pbmc@meta.data$manual_other = d['CD4-1',] > 1 | d['CD3-1',] > 1.75 | d['CD8',] > 1 | d['CD11c',] > 2 | d['CD19',] > 1
+pbmc@meta.data$manual_NK = factor(ifelse(!pbmc@meta.data$manual_other & (d['CD56-1',] > 0.5 & d['CD16',] > 0.5), 'NK', 'other'))
+pbmc@meta.data$manual_ILC = factor(ifelse(!pbmc@meta.data$manual_other & (d['CD127',] > 1 & d['CD161',] > 1), 'ILC', 'other'))
+pbmc@meta.data$refNK = factor(ifelse(pbmc@meta.data$predicted.pbmc.l1=='NK', 'NK', ifelse(pbmc@meta.data$predicted.pbmc.l2=='ILC', 'ILC', NA)))
+pbmc@meta.data$refNKbright = factor(ifelse(pbmc@meta.data$predicted.pbmc.l2=='NK', 'NK', ifelse(pbmc@meta.data$predicted.pbmc.l2=='NK_CD56bright', 'NK bright', ifelse(pbmc@meta.data$predicted.pbmc.l2=='ILC', 'ILC', NA))))
+
+pbmc@meta.data$Tcell = factor(ifelse(d['CD3-1',] > 1.75 & d['CD14',] < 0.5 & d['CD11c',] < 2 & d['CD19',] < 0.5 & d['IgD',] < 1 & d['IgM',] < 1, 'T cell', 'other'))
+pbmc@meta.data$CD4.gated = factor(ifelse(d['CD4-1',] > 1 & d['CD3-1',] > 1.75 & d['CD8',] < 1 & d['CD11c',] < 2, 'CD4 gated', 'other'))
+pbmc@meta.data$Tfh = factor(ifelse(pbmc@meta.data$CD4.gated=='CD4 gated' & d['CD185',] > 0.25 & d['CD278',] > 0.1 & d['CD279',] > 0.5, 'Tfh', 'other'))
+pbmc@meta.data$CD4 = factor(ifelse(pbmc@meta.data$cluster_orig==0, 'CD4 clustered', 'other'))
+
+Idents(pbmc) = pbmc@meta.data$CD4.gated
+
+pbmc.cd4 = subset(pbmc, CD4.gated=='CD4 gated')
+pbmc.cd4 = pbmc.cd4 %>% FindVariableFeatures(verbose=F, assay='RNA') %>% ScaleData(verbose=F, assay='RNA') %>% RunPCA(verbose=F, assay='RNA', reduction.name='RNA.pca') %>% FindVariableFeatures(verbose=F, assay='AB') %>% ScaleData(verbose=F, assay='AB') %>% RunPCA(verbose=F, assay='AB', reduction.name='AB.pca') %>% FindMultiModalNeighbors(reduction.list=list('RNA.pca', 'AB.pca'), dims.list=list(1:30, 1:(nrow(pbmc.cd4[['AB']])-1)), verbose=F, weighted.nn.name='wnn') %>% RunUMAP(nn.name='wnn', reduction.name='sub.wumap', reduction.key='wUMAP_', verbose=F) %>% FindClusters(graph.name='wsnn', algorithm=3, resolution=0.1, verbose=F, cluster.name='CD4.gated.subcluster')
+pbmc.cd4@meta.data$CD4.gated.subcluster = factor(pbmc.cd4@meta.data$CD4.gated.subcluster)
+pbmc.cd4@meta.data$CD4.gated.subannotation = factor(paste('blood', pbmc.cd4@meta.data$CD4.gated.subcluster))
+
+pbmc@meta.data$CD4.gated.subcluster = 'not CD4'
+pbmc@meta.data[rownames(pbmc.cd4@meta.data), ]$CD4.gated.subcluster = pbmc.cd4@meta.data$CD4.gated.subcluster
+pbmc@meta.data$CD4.gated.subcluster = factor(pbmc@meta.data$CD4.gated.subcluster)
+
+pbmc@meta.data$CD4.gated.subannotation = 'not CD4'
+pbmc@meta.data[rownames(pbmc.cd4@meta.data), ]$CD4.gated.subannotation = as.character(pbmc.cd4@meta.data$CD4.gated.subannotation)
+pbmc@meta.data$CD4.gated.subannotation = factor(pbmc@meta.data$CD4.gated.subannotation)
+
+saveRDS(pbmc.cd4, 'data/pbmc.cd4.gated.RDS')
+
+
+pbmc.t = subset(pbmc, Tcell=='T cell') %>%
+   FindVariableFeatures(verbose=F, assay='RNA') %>%
+   ScaleData(verbose=F, assay='RNA') %>%
+   RunPCA(verbose=F, assay='RNA', reduction.name='RNA.pca') %>%
+   FindVariableFeatures(verbose=F, assay='AB') %>%
+   ScaleData(verbose=F, assay='AB') %>%
+   RunPCA(verbose=F, assay='AB', reduction.name='AB.pca') %>%
+   FindMultiModalNeighbors(reduction.list=list('RNA.pca', 'AB.pca'), dims.list=list(1:30, 1:(nrow(pbmc[['AB']])-1)), verbose=F, weighted.nn.name='wnn') %>%
+   RunUMAP(nn.name='wnn', reduction.name='sub.wumap', reduction.key='wUMAP_', verbose=F) %>%
+   FindClusters(graph.name='wsnn', algorithm=3, resolution=0.1, verbose=F, cluster.name='Tcell.subcluster')
+
+# pbmc.t@meta.data$CD4.gated.subcluster = factor(pbmc.t@meta.data$CD4.gated.subcluster)
+# tab = with(subset(pbmc.t@meta.data), table(Tcell.subcluster, predicted.pbmc.l2))
+# perc = tab/rowSums(tab, na.rm=T)
+# sel = apply(perc, 2, max, na.rm=T)>.01
+# cbind(tab[,sel], rowSums(tab)) %>% kbl(col.names=c('# cells', colnames(tab)[sel], 'Σ')) %>% kable_classic(full_width=F)
+# round(perc[,sel]*100, 1) %>% kbl(col.names=c('%', colnames(tab)[sel])) %>% kable_classic(full_width=F)
+pbmc.t@meta.data$Tcell.subannotation = factor(pbmc.t@meta.data$Tcell.subcluster, labels=paste('blood', c('T_1 (mix)', 'T_2 (CD4 TCM/TEM)', 'T_3 (CD8 NK)', 'T_4 (CD4 TCM Treg)', 'T_5 (gdT ILC MAIT)', 'T_6 (mix)', 'T_7 (B)', 'T_8 (CD4 CTL CD8 TEM Treg)', 'T_9 (mix)', 'T_10 (DC CD14 Mono)', 'T_11 (mixed)')))
+DimPlot(pbmc.t, reduction="sub.wumap", group.by='Tcell.subannotation', label=F, label.size=3, repel=T, shuffle=T, alpha=0.5)
+# pbmc.t@meta.data$Tcell.subannotation = factor(paste('skin', pbmc.t@meta.data$Tcell.subcluster))
+
+pbmc@meta.data$Tcell.subcluster = 'no T cell'
+pbmc@meta.data[rownames(pbmc.t@meta.data), ]$Tcell.subcluster = pbmc.t@meta.data$Tcell.subcluster
+pbmc@meta.data$Tcell.subcluster = factor(pbmc@meta.data$Tcell.subcluster)
+
+pbmc@meta.data$Tcell.subannotation = 'no T cell'
+pbmc@meta.data[rownames(pbmc.t@meta.data), ]$Tcell.subannotation = as.character(pbmc.t@meta.data$Tcell.subannotation)
+pbmc@meta.data$Tcell.subannotation = factor(pbmc@meta.data$Tcell.subannotation)
+                                   
+saveRDS(pbmc.t, 'data/pbmc.tcells.RDS')
+
+saveRDS(pbmc, 'data/pbmc.RDS')
+```
+
+The single cell analysis result is available online here:
+[atlas.thlkn.de:3838/shiny-umap/](http://atlas.thlkn.de:3838/shiny-umap/)
+
+

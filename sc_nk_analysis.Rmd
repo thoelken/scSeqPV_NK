@@ -1,0 +1,968 @@
+---
+title: "In-depth analysis of NK cells from both tissues"
+always_allow_html: yes
+date: "Compiled `r Sys.Date()`"
+output:
+  html_document:
+    toc: yes
+    toc_float: yes
+    toc_depth: 6
+    theme: united
+    code_folding: hide
+    collapse: yes
+    css: max.css
+---
+
+[BACK TO INDEX](./index.html)
+
+
+```{r, include=T, eval=T, warning=F, message=F, warning=F}
+library(Seurat)
+library(tidyverse)
+library(DT)
+library(data.table)
+library(ggplot2)
+# library(SeuratDisk)
+library(ggpubr)
+library(rstatix)
+library(celda)
+library(viridis)
+library(ComplexHeatmap)
+library(circlize)
+library(dplyr)
+library(HGNChelper)
+library(openxlsx)
+library(ggrepel)
+library(kableExtra)
+library(ggvenn)
+library(eulerr)
+library(pathfindR)
+# library(RColorBrewer)
+
+library(future)
+plan("multicore", workers=18)
+
+
+volcan = function(res, min.lfc=0, max.pval=0.05, lim.pval=0, lim.lfc=c(-Inf, Inf), label.names=c(''), col.insign='#99999999', col.up='#cc5544', col.down='dodgerblue3', main='', use.adj.pval=T) {
+   if(use.adj.pval) { res$p_val = res$p_val_adj }
+   if(length(min.lfc)==1) min.lfc=c(-min.lfc, min.lfc)
+   if(lim.lfc[1]==-Inf) lim.lfc[1] = min(res$avg_log2FC)
+   if(lim.lfc[2]==Inf) lim.lfc[2] = max(res$avg_log2FC)
+   res$sym = 'unchanged'
+   res$Gene = row.names(res)
+   res = within(res, {
+      reg = factor(rep('insign', nrow(res)), levels=c('down', 'insign', 'up'))
+      reg[p_val <= max.pval & avg_log2FC <= min.lfc[1]] = 'down'
+      reg[p_val <= max.pval & avg_log2FC >= min.lfc[2]] = 'up'
+      if(is.logical(label.names)) {
+         if(label.names) {
+            Gene[reg=='insign'] = NA
+         } else {
+            Gene = NA
+         }
+      } else {
+         Gene[!Gene %in% label.names] = NA
+      }
+      sym[avg_log2FC < lim.lfc[1]] = 'left'
+      sym[avg_log2FC > lim.lfc[2]] = 'right'
+      sym[p_val < lim.pval] = 'top'
+      sym[p_val < lim.pval & avg_log2FC < lim.lfc[1]] = 'topleft'
+      sym[p_val < lim.pval & avg_log2FC > lim.lfc[2]] = 'topright'
+      sym = factor(sym)
+      avg_log2FC[avg_log2FC < lim.lfc[1]] = lim.lfc[1]
+      avg_log2FC[avg_log2FC > lim.lfc[2]] = lim.lfc[2]
+      p_val[p_val < lim.pval] = lim.pval
+   })
+   lab = data.frame(x=lim.lfc, y=c(1, 1), label=as.character(c(sum(res$reg=='down'), sum(res$reg=='up'))), reg=c('down', 'up'))
+   return(ggplot(data=res, aes(x=avg_log2FC, y=-log10(p_val), col=reg, label=Gene, shape=sym)) + geom_point(size=2) + theme_classic() +
+      geom_text_repel(data=res, aes(x=avg_log2FC, y=-log10(p_val), label=Gene), point.size=3, show.legend=F, na.rm=T, size=3, point.padding=0.2, box.padding=1, segment.curvature=-1e-20, max.overlaps=Inf,
+                          force=1.5, force_pull=0.4, segment.size=0.1, min.segment.length=unit(0, 'lines'), nudge_x=ifelse(res$reg=='down', -1, 1), nudge_y=ifelse(res$reg=='insign', -0.1, .1)) +
+      annotate(geom='text', x=lim.lfc, y=c(0,0), label=c(sum(res$reg=='down'), sum(res$reg=='up')), col=c(col.down, col.up)) +
+      scale_color_manual(values=list(up=col.up, down=col.down, insign=col.insign)) + scale_y_continuous(expand=c(0,0.1)) +
+      scale_shape_manual(values=c("unchanged"="\u25CF", "top"="\u25B2", "left"="\u25C0", "right"="\u25B6", "topleft"="\u25E4", "topright"="\u25E5"), guide='none') +
+      ggtitle(main, subtitle=ifelse(use.adj.pval, '* adjusted p-values', '* un-adjusted p-values')) + geom_vline(xintercept=min.lfc, lty=2, color=col.insign) + geom_hline(yintercept=-log10(max.pval), lty=2, color=col.insign))
+}
+
+vennDE = function(results, max_p=0.05, min_log2FC=0, use.adj.pval=F, title='overlap of differentially expressed genes') {
+   for(i in names(results)) {
+      results[[i]] = within(results[[i]], {p_val[is.na(p_val)] = 1; p_val_adj[is.na(p_val_adj)] = 1; if(use.adj.pval) p_val = p_val_adj})
+   }
+   reg = lapply(results, function(r) {list(reg=row.names(r[r$p_val<max_p,]), up=row.names(r[r$p_val<max_p & r$avg_log2FC>min_log2FC,]), down=row.names(r[r$p_val<max_p & r$avg_log2FC<(-min_log2FC),]))})
+   print(ggvenn(lapply(reg, function(r) {r$reg}), set_name_size=4, stroke_size=0.5, show_percentage=F, fill_color=as.vector(cols$Health)) + ggtitle(title))
+   comps = c()
+   for(i in names(reg)) {
+      other = names(reg)[names(reg) != i] # other dataset names
+      cat(paste(i, 'exclusive:   up-regulated:', paste(reg[[i]]$up[!reg[[i]]$up %in% unlist(lapply(other, function(o) reg[[o]]$reg))], collapse=' '), '  down-regulated:', paste(reg[[i]]$down[!reg[[i]]$down %in% unlist(lapply(other, function(o) reg[[o]]$reg))], collapse=' '), '\n'))
+      for(o in other) {
+         c = paste(sort(c(i, o)), collapse=' & ')
+         if(c %in% comps) next # already compared
+         wrong = c(reg[[i]]$up[reg[[i]]$up %in% reg[[o]]$down], reg[[i]]$down[reg[[i]]$down %in% reg[[o]]$up])
+         for (w in wrong) warning(paste('there is conflicting regulation for', w, 'between', c))
+         rest = other[other != o]
+         if(length(rest)>0) rest = unlist(lapply(rest, function(r) reg[[r]]$reg))
+         cat(paste(c, '   up-regulated:', paste(reg[[i]]$up[reg[[i]]$up %in% reg[[o]]$up & !reg[[i]]$up %in% rest], collapse=' '), '   down-regulated:', paste(reg[[i]]$down[reg[[i]]$down %in% reg[[o]]$down & !reg[[i]]$down %in% rest], collapse=' '),'\n'))
+         comps = c(comps, c)
+      }
+   }
+   if(length(results)>2) 
+      cat(paste('in ALL    up-regulated:', paste(reg[[i]]$up[sapply(reg[[i]]$up, function(x) all(sapply(reg, function(r) x %in% r$up)))], collapse=' '), '   down-regulated:', paste(reg[[i]]$down[sapply(reg[[i]]$down, function(x) all(sapply(reg, function(r) x %in% r$down)))], collapse=' '),'\n'))
+}
+
+
+scHeat = function(so.sub, var, first, second, plot=T) {
+   so.c.cells = table(so.sub@meta.data$Sample_Name)
+   Idents(so.sub) = so.sub@meta.data[[var]]
+   if(length(table(Idents(so.sub)))==1 | any(table(Idents(so.sub))[c(first, second)]<3)) { cat(paste(c('\nless than 3 cells per condition\n'))); return() }
+   
+   so.c.cells = table(so.sub@meta.data$Sample_Name)
+   so.c.mark = FindMarkers(so.sub, test.use="MAST", ident.1=first, ident.2=second, assay='RNA', verbose=F, min.pct=0.1)
+   so.c.mark = subset(so.c.mark, p_val_adj<0.1 & abs(avg_log2FC)>0.1)
+   if(nrow(so.c.mark)<1) { cat(paste(c('\nno significant genes for', first, 'vs', second,'\n'))); return();}
+   
+   l2fc = so.c.mark[,"avg_log2FC", drop=F]
+   padj = so.c.mark[,"p_val_adj", drop=F]
+   padj = ifelse(padj<0.001,"***",ifelse(padj<0.01,"**",ifelse(padj<0.05,"*","")))
+
+   p1 = Heatmap(l2fc, name="l2FC", column_gap=unit(0, "mm"), border=T, column_names_gp=gpar(fontsize=10),
+                row_names_gp=gpar(fontsize=10), column_title_gp=gpar(fontsize=8), row_title_rot=0, 
+                cluster_rows=T, cluster_columns=F, show_heatmap_legend=F,
+                cell_fun=function(j, i, x, y, w, h, fill) { grid.text(paste0(signif(l2fc[i,j], 2), " ", padj[i,j]), x, y, gp=gpar(fontsize=7)) },
+                col=colorRamp2(c(-2, 0, 2), c("#3344aa", "#eeeeee", "#aa4444")))
+
+   pct = so.c.mark[,c("pct.1", "pct.2"), drop=F]
+   colnames(pct) = c(first, second)
+
+   p2 = Heatmap(as.matrix(pct), name="pct", column_names_gp=gpar(fontsize=10),
+                row_names_gp=gpar(fontsize=12), column_title_gp=gpar(fontsize=8), column_gap=unit(0, "mm"),
+                cluster_rows=T, cluster_columns=F, row_title_rot=0, border=T, show_heatmap_legend=F,
+                cell_fun=function(j, i, x, y, w, h, fill) { grid.text(signif(pct[i, j], 2), x, y, gp=gpar(fontsize=10)) },
+                col=colorRamp2(c(0, 1), c("#ffffff", "#555555")))
+   
+   avg_expr = AverageExpression(so.sub, return.seurat=F, assays="RNA", group.by="Sample_Name", slot="data", verbose=F)[[1]][rownames(so.c.mark), , drop=F]
+   avg_expr = avg_expr/rowSums(avg_expr, na.rm=T)*100
+
+   p3 = Heatmap(as.matrix(avg_expr), name="mean(exp)", row_km=2, row_names_gp=gpar(fontsize=10),
+                cluster_rows=T, cluster_columns=F, show_heatmap_legend=F, column_names_gp=gpar(fontsize=10),
+                column_title_gp=gpar(fontsize=8), column_gap=unit(0, "mm"), row_title_rot=0, border=T,
+                cell_fun=function(j, i, x, y, w, h, fill) { grid.text(paste(round(avg_expr[i, j], 1), '%'), x, y, gp=gpar(fontsize=10)) },
+                top_annotation=columnAnnotation(cells=anno_barplot(unlist(list(so.c.cells)), height=unit(10, "mm"), border=F, add_numbers=T, gp=gpar(fill="#CCCCCC", col='white'))),
+                col=colorRamp2(c(0, max(avg_expr)), c("#ffffff", "#44aa55")))
+   
+   if(plot) {print(p1+p2+p3)}
+   so.c.mark
+}
+
+
+cols = list(Health=c(PV='#E0ED7C', BP='#2BCCC1', PSORI='#6AC631', `PV&BP`='#70eD9C', `PV&PSORI`='#a0dD5C', `BP&PSORI`='#20CD8C', `PV&BP&PSORI`='#F0FDDC', HC='#C5CAC7'), Lesion=c(lesional='#ff5577', perilesional='#ff99aa', ' '='#555555', healthy='#C5CAC7'), Replicate=c('1'='#ccaaff', '2'='#8866cc', '3'='#440077'), dir=c(up='#ff4466', down='#4466ff'))
+
+biramp = function(n) {as.vector(t(cbind(viridis(ceiling(n/2)), colorRampPalette(c('#eedd00', '#ff5533', '#441199'), interpolate="spline", space="Lab")(ceiling(n/2)))))}
+
+skin = readRDS('data/skin.RDS')
+pbmc = readRDS('data/pbmc.RDS')
+skin@meta.data$annotation = factor(paste('skin', skin@meta.data$annotation))
+pbmc@meta.data$annotation = factor(paste('blood', pbmc@meta.data$annotation))
+
+skin@meta.data$subannotation = factor(paste('skin', skin@meta.data$subannotation))
+pbmc@meta.data$subannotation = factor(paste('blood', pbmc@meta.data$subannotation))
+
+# skin = JoinLayers(skin)
+
+skin.nk = subset(skin, cluster_orig==3)
+pbmc.nk = subset(pbmc, cluster_orig==2)
+
+both.nk = merge(skin.nk, pbmc.nk)
+# both.nk@meta.data$Health = factor(both.nk@meta.data$Health, levels=c('HC', 'PV', 'PSORI', 'BP'), labels=c('HC', 'PV', 'PSORI', 'BP'))
+both.nk = JoinLayers(both.nk)
+both.nk[['RNA']] <- split(both.nk[["RNA"]], f=both.nk$Run)
+both.nk[['AB']] <- split(both.nk[["AB"]], f=both.nk$Run)
+
+both.nk <- both.nk %>%
+   NormalizeData(verbose=F, assay='RNA') %>%
+   FindVariableFeatures(verbose=F, assay='RNA') %>%
+   ScaleData(verbose=F, assay='RNA') %>%
+   RunPCA(verbose=F, assay='RNA', reduction.name='RNA.pca')#, slot='SCT')
+
+# DefaultAssay(both.nk) <- 'AB'
+both.nk <- both.nk %>%
+   NormalizeData(verbose=F, normalization.method='CLR', margin=2, assay='AB') %>%
+   FindVariableFeatures(verbose=F, assay='AB') %>%
+   ScaleData(verbose=F, assay='AB') %>%
+   RunPCA(verbose=F, assay='AB', reduction.name='AB.pca')
+```
+
+# Characterization of NK cell clusters
+
+## Re-Integrating the NK subpopulation 
+Because the sequencing was split into three different runs, we expect to have technical variance due to sequencing efficiency and biological/exprimental variance due to the efficiency of harvesting cells from different tissue.
+
+### Unintegrated Batches
+Naively, we can project all cells using a weighted (RNA/ADT) UMAP without accounting for any batch effects.
+We expect there to be clear separation of runs espcially between skin cells and PBMCs.
+```{r, echo=F, warning=F, message=F, warning=F}
+both.nk <- FindMultiModalNeighbors(both.nk, reduction.list=list('RNA.pca', 'AB.pca'), dims.list=list(1:30, 1:(nrow(both.nk[['AB']])-1)), verbose=F, weighted.nn.name='wnn')
+both.nk <- RunUMAP(both.nk, nn.name='wnn', reduction.name='wnn.umap', reduction.key='wUMAP_', verbose=F)
+both.nk <- FindClusters(both.nk, graph.name='wsnn', algorithm=3, resolution=0.1, verbose=F, cluster.name='unintegrated.wnn.NKcluster')
+DimPlot(both.nk, reduction='wnn.umap')
+DimPlot(both.nk, reduction='wnn.umap', group.by='Run')
+DimPlot(both.nk, reduction='wnn.umap', group.by='Lesion')
+DimPlot(both.nk, reduction='wnn.umap', group.by='subannotation')
+DimPlot(both.nk, reduction='wnn.umap', group.by='unintegrated.wnn.NKcluster')
+
+saveRDS(subset(both.nk, Tissue=='skin'), 'data/skin.nk.RDS')
+saveRDS(subset(both.nk, Tissue=='pbmc'), 'data/pbmc.nk.RDS')
+```
+
+The following methods try to integrate the differences in sequencing variance by matching cell populations between batches and normalizing the data for Clustering and the UMAP based on RNA and ADT PCAs independently.
+
+### CCA Integration
+Standard Seurat anchor-based approach using Canonical Correlation Analysis.
+```{r, echo=F, warning=F, message=F, warning=F}
+both.nk <- IntegrateLayers(both.nk, method=CCAIntegration, orig.reduction='RNA.pca', new.reduction='iRNA.cca', verbose=F, assay='RNA')#, normalization.method='SCT')
+both.nk <- IntegrateLayers(both.nk, method=CCAIntegration, orig.reduction='AB.pca', new.reduction='iAB.cca', verbose=F, assay='AB')
+both.nk <- FindMultiModalNeighbors(both.nk, reduction.list=list('iRNA.cca', 'iAB.cca'), dims.list=list(1:30, 1:18), verbose=F, weighted.nn.name='iwnn', knn.graph.name='iwknn', snn.graph.name='iwsnn')
+both.nk <- RunUMAP(both.nk, nn.name='iwnn', reduction.name='iwnn.umap', reduction.key='iwnnUMAP_', verbose=F)
+both.nk <- FindClusters(both.nk, graph.name='iwsnn', algorithm=3, resolution=0.1, verbose=F, cluster.name='iwnn.NKcluster')
+DimPlot(both.nk, reduction='iwnn.umap')
+DimPlot(both.nk, reduction='iwnn.umap', group.by='Run')
+DimPlot(both.nk, reduction='iwnn.umap', group.by='Tissue')
+DimPlot(both.nk, reduction='iwnn.umap', group.by='Lesion')
+DimPlot(both.nk, reduction='iwnn.umap', group.by='subcluster')
+DimPlot(both.nk, reduction='iwnn.umap', group.by='iwnn.NKcluster')
+saveRDS(both.nk, 'data/combined.nk.RDS')
+```
+
+
+## Skin Subcluster Annotations
+
+### Health
+
+```{r, fig.width=9, fig.height=5}
+p = ggplot(both.nk@meta.data, aes(x=Health, fill=subannotation)) + geom_bar(position='fill') + 
+   facet_grid(rows=vars(Tissue, Lesion), labeller=label_wrap_gen(width=16, multi_line=T), scales="free", space="free") +
+   scale_fill_manual(values=biramp(8)) +
+   theme_classic() + coord_flip() + ylab('cell composition [%]') + xlab('Groups') + scale_y_continuous(breaks=(0:4)/4, labels=(0:4)*25, expand=c(0.002, 0.002)) + theme(legend.title=element_text(size=11), legend.key.height=unit(4, 'mm'), legend.key.width=unit(8, 'mm'))
+p; ggsave('sc_nk_composition_subcluster.svg', plot=p, width=9, height=5)
+```
+
+#### Skin
+lesional and HC only
+```{r, echo=F, warning=F, message=F, warning=F}
+tab = with(subset(both.nk@meta.data, Tissue=='skin' & Lesion!='perilesional'), table(subcluster, Health, exclude=grep('_', subcluster, value=T, invert=T)))
+tab = t(t(tab)/rowSums(t(tab)))
+tab = round(tab/rowSums(tab, na.rm=T)*100, 1)
+tab = tab[,apply(tab, 2, max, na.rm=T)>1]
+tab %>% kbl(col.names=c('%', colnames(tab))) %>% kable_classic(full_width=F)
+```
+
+```{r, fig.width=9, fig.height=3.5}
+ggplot(subset(both.nk@meta.data, Tissue=='skin' & Lesion!='perilesional'), aes(x=Health, fill=subannotation)) + geom_bar(position='fill') + 
+   scale_fill_manual(values=biramp(12)) +
+   theme_classic() + coord_flip() + ylab('cell composition [%]') + xlab('Groups') + scale_y_continuous(breaks=(0:4)/4, labels=(0:4)*25, expand=c(0.002, 0.002)) + theme(legend.title=element_text(size=11), legend.key.height=unit(4, 'mm'), legend.key.width=unit(8, 'mm'))
+```
+
+##### Perilesional only
+```{r, echo=F, warning=F, message=F, warning=F}
+tab = with(subset(both.nk@meta.data, Tissue=='skin' & Lesion=='perilesional'), table(subcluster, Health, exclude=grep('_', subcluster, value=T, invert=T)))
+tab = t(t(tab)/rowSums(t(tab)))
+tab = round(tab/rowSums(tab, na.rm=T)*100, 1)
+tab = tab[,apply(tab, 2, max, na.rm=T)>1]
+tab %>% kbl(col.names=c('%', colnames(tab))) %>% kable_classic(full_width=F)
+```
+
+```{r, fig.width=9, fig.height=3.5}
+ggplot(subset(both.nk@meta.data, Tissue=='skin' & Lesion=='perilesional'), aes(x=Health, fill=subannotation)) + geom_bar(position='fill') + 
+   scale_fill_manual(values=biramp(12)) +
+   theme_classic() + coord_flip() + ylab('cell composition [%]') + xlab('Groups') + scale_y_continuous(breaks=(0:4)/4, labels=(0:4)*25, expand=c(0.002, 0.002)) + theme(legend.title=element_text(size=11), legend.key.height=unit(4, 'mm'), legend.key.width=unit(8, 'mm'))
+```
+
+#### Blood
+```{r, echo=F, warning=F, message=F, warning=F}
+tab = with(subset(both.nk@meta.data, Tissue!='skin'), table(subcluster, Health, exclude=grep('_', subcluster, value=T, invert=T)))
+tab = t(t(tab)/rowSums(t(tab)))
+tab = round(tab/rowSums(tab, na.rm=T)*100, 1)
+tab = tab[,apply(tab, 2, max, na.rm=T)>1]
+tab %>% kbl(col.names=c('%', colnames(tab))) %>% kable_classic(full_width=F)
+```
+
+```{r, fig.width=9, fig.height=3.5}
+ggplot(subset(both.nk@meta.data, Tissue=='pbmc'), aes(x=Health, fill=subannotation)) + geom_bar(position='fill') + 
+   scale_fill_manual(values=biramp(12)) +
+   theme_classic() + coord_flip() + ylab('cell composition [%]') + xlab('Groups') + scale_y_continuous(breaks=(0:4)/4, labels=(0:4)*25, expand=c(0.002, 0.002)) + theme(legend.title=element_text(size=11), legend.key.height=unit(4, 'mm'), legend.key.width=unit(8, 'mm'))
+```
+
+
+### PBMC ref level 2
+```{r, echo=F, warning=F, message=F, warning=F}
+tab = table(skin.nk@meta.data$subcluster, skin.nk@meta.data$predicted.pbmc.l2, exclude=grep('3_', levels(skin.nk@meta.data$subcluster), value=T, invert=T))
+tab = tab[,apply(tab/rowSums(tab), 2, max, na.rm=T)>0.01]
+round(tab/rowSums(tab)*100, 1) %>% kbl(col.names=c('%', colnames(tab))) %>% kable_classic(full_width=F)
+```
+
+### PBMC ref level 3
+```{r, echo=F, warning=F, message=F, warning=F}
+tab = table(skin.nk@meta.data$subcluster, skin.nk@meta.data$predicted.pbmc.l3, exclude=grep('3_', levels(skin.nk@meta.data$subcluster), value=T, invert=T))
+tab = tab[,apply(tab/rowSums(tab), 2, max, na.rm=T)>0.05]
+round(tab/rowSums(tab)*100, 1) %>% kbl(col.names=c('%', colnames(tab))) %>% kable_classic(full_width=F)
+```
+
+### RashX
+```{r, echo=F, warning=F, message=F, warning=F}
+tab = table(skin.nk@meta.data$subcluster, skin.nk@meta.data$scType, exclude=grep('3_', levels(skin.nk@meta.data$subcluster), value=T, invert=T))
+tab = tab[,apply(tab/rowSums(tab), 2, max, na.rm=T)>0.05]
+round(tab/rowSums(tab)*100, 1) %>% kbl(col.names=c('%', colnames(tab))) %>% kable_classic(full_width=F)
+```
+
+### scType
+```{r, echo=F, warning=F, message=F, warning=F}
+tab = table(skin.nk@meta.data$subcluster, skin.nk@meta.data$predicted.skin, exclude=grep('3_', levels(skin.nk@meta.data$subcluster), value=T, invert=T))
+tab = tab[,apply(tab/rowSums(tab), 2, max, na.rm=T)>0.05]
+round(tab/rowSums(tab)*100, 1) %>% kbl(col.names=c('%', colnames(tab))) %>% kable_classic(full_width=F)
+```
+
+## Subclusters Reference Annotation
+```{r, echo=F, warning=F, message=F, warning=F}
+tab = table(pbmc.nk@meta.data$subcluster, pbmc.nk@meta.data$predicted.pbmc.l2, exclude=grep('2_', levels(pbmc.nk@meta.data$subcluster), value=T, invert=T))
+tab = tab[,apply(tab/rowSums(tab), 2, max, na.rm=T)>0.01]
+round(tab/rowSums(tab)*100, 1) %>% kbl(col.names=c('%', colnames(tab))) %>% kable_classic(full_width=F)
+
+tab = table(pbmc.nk@meta.data$subcluster, pbmc.nk@meta.data$predicted.pbmc.l3, exclude=grep('2_', levels(pbmc.nk@meta.data$subcluster), value=T, invert=T))
+tab = tab[,apply(tab/rowSums(tab), 2, max, na.rm=T)>0.05]
+round(tab/rowSums(tab)*100, 1) %>% kbl(col.names=c('%', colnames(tab))) %>% kable_classic(full_width=F)
+```
+
+## Lesional Skin Markers
+Cluster 3 from skin and cluster 2 from PBMC analysis were identified as mostly NK cells.
+
+### Transcripts Markers
+```{r, echo=F, warning=F, message=F, warning=F}
+skin = JoinLayers(skin, assay='RNA')
+skin.rna.markers = FindMarkers(subset(skin, Lesion!='perilesional'), ident.1='3', group.by='cluster_orig', min.pct=0.25, verbose=F, assay='RNA')
+datatable(round(skin.rna.markers, 3), filter='top', extensions='Buttons', options=list(dom='Bfrtip', buttons=c('copy', 'csv', 'excel', 'pdf', 'print')))
+
+pf <- run_pathfindR(data.frame(Gene.symbol=row.names(skin.rna.markers), logFC=skin.rna.markers$avg_log2FC, adj.P.Val=skin.rna.markers$p_val_adj))
+datatable(pf[grep('killer', pf$Term_Description),])
+# gg_list <- visualize_terms(
+#   result_df = pf,
+#   input_processed = input_processing(data.frame(Gene.symbol=row.names(skin.rna.markers), logFC=skin.rna.markers$avg_log2FC, adj.P.Val=skin.rna.markers$p_val_adj)),
+#   is_KEGG_result = TRUE
+# )
+# print(gg_list$hsa04650)
+# term_gene_heatmap(pf)
+# term_gene_graph(pf)
+# UpSet_plot(pf)
+```
+
+#### Subcluster Profiles
+lesional disease only
+```{r, fig.width=7, fig.height=3.5, warning=F, message=F}
+Idents(skin.nk) = skin.nk$subannotation
+skin.nk.rna.markers = FindAllMarkers(subset(skin.nk, Lesion=='lesional'), min.pct=0.25, verbose=F, assay='RNA')
+skin.nk.rna.markers.top = skin.nk.rna.markers %>% group_by(cluster) %>% top_n(2, avg_log2FC)
+p = DotPlot(subset(skin.nk, Lesion=='lesional'), features=unique(skin.nk.rna.markers.top$gene), scale.by='size', scale=T) + scico::scale_color_scico(palette = "vik") + RotatedAxis()
+p; ggsave('sc_skin_nk_dotplot_subcluster.svg', plot=p, width=11, height=4)
+```
+
+```{r, fig.width=11, fig.height=5, warning=F, message=F}
+Idents(skin.nk) = skin.nk@meta.data$Health
+skin.nk = JoinLayers(skin.nk, assay='RNA')
+skin.rna.markers = FindAllMarkers(subset(skin.nk, Lesion!='perilesional'), group.by='Health', min.pct=0.25, verbose=T, assay='RNA')
+skin.rna.markers.top = skin.rna.markers %>% group_by(cluster) %>% top_n(2, avg_log2FC)
+skin.rna.markers.top = skin.rna.markers.top[, c('gene', 'cluster', 'avg_log2FC', 'p_val_adj')]
+skin.rna.markers.top$avg_log2FC = signif(skin.rna.markers.top$avg_log2FC, digits=2)
+skin.rna.markers.top$p_val_adj = signif(skin.rna.markers.top$p_val_adj, digits=2)
+
+DotPlot(subset(skin.nk, Lesion!='perilesional'), features=unique(skin.rna.markers.top$gene), scale.by='size', scale=T) + scico::scale_color_scico(palette = "vik") + RotatedAxis() + ggtitle('NK Subpopulation Health Markers')
+
+DoHeatmap(skin.nk, features=unique(skin.rna.markers.top$gene), size=3, slot='count', disp.max=10) + scale_fill_viridis()
+
+Idents(skin.nk) = skin.nk@meta.data$Lesion
+skin.nk = JoinLayers(skin.nk, assay='RNA')
+skin.rna.markers = FindAllMarkers(skin.nk, group.by='Lesion', min.pct=0.25, verbose=T, assay='RNA')
+skin.rna.markers.top = skin.rna.markers %>% group_by(cluster) %>% top_n(2, avg_log2FC)
+skin.rna.markers.top = skin.rna.markers.top[, c('gene', 'cluster', 'avg_log2FC', 'p_val_adj')]
+skin.rna.markers.top$avg_log2FC = signif(skin.rna.markers.top$avg_log2FC, digits=2)
+skin.rna.markers.top$p_val_adj = signif(skin.rna.markers.top$p_val_adj, digits=2)
+
+DotPlot(skin.nk, features=unique(skin.rna.markers.top$gene), scale.by='size', scale=T) + scico::scale_color_scico(palette = "vik") + RotatedAxis() + ggtitle('NK Subpopulation Lesion Markers')
+
+DoHeatmap(skin.nk, features=unique(skin.rna.markers.top$gene), size=3, slot='count', disp.max=10) + scale_fill_viridis()
+```
+
+### Surface Markers
+```{r, echo=F, warning=F, message=F, warning=F}
+skin.ab.markers = FindMarkers(subset(skin, Lesion!='perilesional'), ident.1='3', group.by='cluster_orig', min.pct=0.25, verbose=F, assay='AB')
+datatable(round(skin.ab.markers, 3), filter='top', extensions='Buttons', options=list(dom='Bfrtip', buttons=c('copy', 'csv', 'excel', 'pdf', 'print')))
+```
+
+## Blood Markers
+
+### Transcripts Markers
+```{r, echo=F, warning=F, message=F, warning=F}
+pbmc.rna.markers = FindMarkers(pbmc, ident.1='2', group.by='cluster_orig', min.pct=0.25, verbose=F, assay='RNA')
+datatable(round(pbmc.rna.markers, 3), filter='top', extensions = 'Buttons', options = list(dom = 'Bfrtip', buttons = c('copy', 'csv', 'excel', 'pdf', 'print')))
+
+pf <- run_pathfindR(data.frame(Gene.symbol=row.names(pbmc.rna.markers), logFC=pbmc.rna.markers$avg_log2FC, adj.P.Val=pbmc.rna.markers$p_val_adj))
+```
+
+#### Subcluster Profiles
+```{r, fig.width=7, fig.height=3.5, warning=F, message=F}
+Idents(pbmc.nk) = pbmc.nk$subannotation
+pbmc.nk.rna.markers = FindAllMarkers(pbmc.nk, min.pct=0.25, verbose=F, assay='RNA')
+pbmc.nk.rna.markers.top = pbmc.nk.rna.markers %>% group_by(cluster) %>% top_n(2, avg_log2FC)
+p = DotPlot(pbmc.nk, features=unique(pbmc.nk.rna.markers.top$gene), scale.by='size', scale=T) + scico::scale_color_scico(palette = "vik") + RotatedAxis()
+p; ggsave('sc_blood_nk_dotplot_subcluster.svg', plot=p, width=11, height=4)
+```
+
+```{r, fig.width=11, fig.height=5, warning=F, message=F}
+Idents(pbmc.nk) = pbmc.nk@meta.data$Health
+# pbmc.nk = JoinLayers(pbmc.nk, assay='RNA')
+pbmc.rna.markers = FindAllMarkers(pbmc.nk, group.by='Health', min.pct=0.25, verbose=T, assay='RNA')
+pbmc.rna.markers.top = pbmc.rna.markers %>% group_by(cluster) %>% top_n(2, avg_log2FC)
+pbmc.rna.markers.top = pbmc.rna.markers.top[, c('gene', 'cluster', 'avg_log2FC', 'p_val_adj')]
+pbmc.rna.markers.top$avg_log2FC = signif(pbmc.rna.markers.top$avg_log2FC, digits=2)
+pbmc.rna.markers.top$p_val_adj = signif(pbmc.rna.markers.top$p_val_adj, digits=2)
+
+DotPlot(pbmc.nk, features=unique(pbmc.rna.markers.top$gene), scale.by='size', scale=T) + scico::scale_color_scico(palette = "vik") + RotatedAxis() + ggtitle('NK Subpopulation Health Markers')
+
+DoHeatmap(pbmc.nk, features=unique(pbmc.rna.markers.top$gene), size=3, slot='count', disp.max=10) + scale_fill_viridis()
+```
+
+### Surface Markers
+```{r, echo=F, warning=F, message=F, warning=F}
+pbmc.ab.markers = FindMarkers(pbmc, ident.1='2', group.by='cluster_orig', min.pct=0.25, verbose=F, assay='AB')
+datatable(round(pbmc.ab.markers, 3), filter='top', extensions = 'Buttons', options = list(dom = 'Bfrtip', buttons = c('copy', 'csv', 'excel', 'pdf', 'print')))
+```
+
+
+## Differential Expression analysis by Tissue
+Results are shown as Skin (lesional) vs Blood
+
+### RNA
+```{r}
+both.nk = JoinLayers(both.nk, assay='RNA')
+nk.rna.markers = FindMarkers(subset(both.nk, Lesion!='perilesional'), ident.1='skin', ident.2='pbmc', group.by='Tissue', min.pct=0.25, verbose=F, assay='RNA')
+datatable(round(nk.rna.markers, 3), filter='top', extensions='Buttons', options=list(dom='Bfrtip', buttons=c('copy', 'csv', 'excel', 'pdf', 'print')))
+volcan(nk.rna.markers, use.adj.pval=T)
+# DoHeatmap(both.nk, features=rownames(nk.rna.markers)[1:10], assay="RNA", group.by='cluster') + NoLegend()
+
+Idents(both.nk) = both.nk@meta.data$Tissue
+nk.rna.markers = FindAllMarkers(subset(both.nk, Lesion!='perilesional'), group.by='Tissue', min.pct=0.25, verbose=F, assay='RNA')
+nk.rna.markers.top = nk.rna.markers %>% group_by(cluster) %>% top_n(2, avg_log2FC)
+nk.rna.markers.top = nk.rna.markers.top[, c('gene', 'cluster', 'avg_log2FC', 'p_val_adj')]
+nk.rna.markers.top$avg_log2FC = signif(nk.rna.markers.top$avg_log2FC, digits=2)
+nk.rna.markers.top$p_val_adj = signif(nk.rna.markers.top$p_val_adj, digits=2)
+
+pf <- run_pathfindR(data.frame(Gene.symbol=row.names(nk.rna.markers), logFC=nk.rna.markers$avg_log2FC, adj.P.Val=nk.rna.markers$p_val_adj))
+
+# term_gene_heatmap(pf)
+# term_gene_graph(pf)
+# UpSet_plot(pf)
+
+DotPlot(both.nk, features=unique(nk.rna.markers.top$gene), scale.by='size', scale=T) + scico::scale_color_scico(palette = "vik") + RotatedAxis() + ggtitle('NK Subpopulation Tissue Markers')
+
+# DoHeatmap(both.nk, features=unique(nk.rna.markers.top$gene), size=3, slot='count', disp.max=10) + scale_fill_viridis()
+```
+
+### Surface Markers
+```{r}
+both.nk = JoinLayers(both.nk, assay='AB')
+nk.ab.markers = FindMarkers(subset(both.nk, Lesion!='perilesional'), ident.1='skin', ident.2='pbmc', group.by='Tissue', min.pct=0.25, verbose=F, assay='AB')
+datatable(round(nk.ab.markers, 3), filter='top', extensions='Buttons', options=list(dom='Bfrtip', buttons=c('copy', 'csv', 'excel', 'pdf', 'print')))
+volcan(nk.ab.markers, use.adj.pval=T, label.names=T)
+```
+
+## pseudo bulk RNA-Seq analysis
+The following comparisons are analyzed by aggregating cell expression per condition and testing the counts with DESeq2 for RNAs and normalized data with MAST for surface markers.
+**Comparisons are always conducted in the direction indicated in the title.**  Thus a positive logFoldChange in "PV vs HC" means upregulation in PV compared to the background of HC.
+
+```{r, message=F, warning=F}
+both.nk@meta.data$Sample = paste(both.nk@meta.data$Tissue, both.nk@meta.data$Lesion, both.nk@meta.data$Sample_Name, sep='_')
+Idents(both.nk) = both.nk@meta.data$Tissue
+bulk.rna.nk <- AggregateExpression(both.nk, assays='RNA', group.by=c('Tissue', 'Health', 'Replicate', 'Lesion'), return.seurat=T, verbose=F)
+bulk.ab.nk <- AggregateExpression(both.nk, assays='AB', group.by=c('Tissue', 'Health', 'Replicate', 'Lesion'), return.seurat=T, verbose=F)
+```
+
+
+### Just in Skin
+
+#### Lesional vs Perilesional
+of all diseases
+
+##### RNA
+```{r, message=F, warning=F}
+bulk.nk.de <- FindMarkers(subset(bulk.rna.nk, Tissue=='skin'), ident.1="lesional", ident.2="perilesional", group.by='Lesion', test.use="DESeq2", max.cells.per.ident = 10000)
+bulk.nk.de$p_val_adj[is.na(bulk.nk.de$p_val_adj)] = 1; bulk.nk.de$p_val[is.na(bulk.nk.de$p_val)] = 1
+datatable(round(bulk.nk.de, 3), filter='top', extensions='Buttons', options=list(dom='Bfrtip', buttons=c('copy', 'csv', 'excel', 'pdf', 'print')))
+volcan(bulk.nk.de, use.adj.pval=F, label.names=T)
+pf <- run_pathfindR(data.frame(Gene.symbol=row.names(bulk.nk.de), logFC=bulk.nk.de$avg_log2FC, adj.P.Val=bulk.nk.de$p_val), p_val_threshold=0.05)
+```
+
+##### Surface Markers
+```{r, message=F, warning=F}
+bulk.nk.de <- FindMarkers(subset(bulk.ab.nk, Tissue=='skin'), ident.1="lesional", ident.2="perilesional", group.by='Lesion', test.use='MAST')
+datatable(round(bulk.nk.de, 3), filter='top', extensions='Buttons', options=list(dom='Bfrtip', buttons=c('copy', 'csv', 'excel', 'pdf', 'print')))
+volcan(bulk.nk.de, use.adj.pval=F, label.names=T)
+```
+
+#### Lesional vs HC
+of all diseases
+
+##### RNA
+```{r, message=F, warning=F}
+bulk.nk.de <- FindMarkers(subset(bulk.rna.nk, Tissue=='skin'), ident.1="lesional", ident.2="healthy", group.by='Lesion', test.use="DESeq2")
+bulk.nk.de$p_val_adj[is.na(bulk.nk.de$p_val_adj)] = 1; bulk.nk.de$p_val[is.na(bulk.nk.de$p_val)] = 1
+datatable(round(bulk.nk.de, 3), filter='top', extensions='Buttons', options=list(dom='Bfrtip', buttons=c('copy', 'csv', 'excel', 'pdf', 'print')))
+volcan(bulk.nk.de, use.adj.pval=F, label.names=T)
+pf <- run_pathfindR(data.frame(Gene.symbol=row.names(bulk.nk.de), logFC=bulk.nk.de$avg_log2FC, adj.P.Val=bulk.nk.de$p_val), p_val_threshold=0.05)
+```
+
+##### Surface Markers
+```{r, message=F, warning=F}
+bulk.nk.de <- FindMarkers(subset(bulk.ab.nk, Tissue=='skin'), ident.1="lesional", ident.2="healthy", group.by='Lesion', test.use='MAST')
+datatable(round(bulk.nk.de, 3), filter='top', extensions='Buttons', options=list(dom='Bfrtip', buttons=c('copy', 'csv', 'excel', 'pdf', 'print')))
+volcan(bulk.nk.de, use.adj.pval=F, label.names=T)
+```
+
+
+#### Perilesional vs HC
+of all diseases
+
+##### RNA
+```{r, message=F, warning=F}
+bulk.nk.de <- FindMarkers(subset(bulk.rna.nk, Tissue=='skin'), ident.1="perilesional", ident.2="healthy", group.by='Lesion', test.use="DESeq2")
+bulk.nk.de$p_val_adj[is.na(bulk.nk.de$p_val_adj)] = 1; bulk.nk.de$p_val[is.na(bulk.nk.de$p_val)] = 1
+datatable(round(bulk.nk.de, 3), filter='top', extensions='Buttons', options=list(dom='Bfrtip', buttons=c('copy', 'csv', 'excel', 'pdf', 'print')))
+volcan(bulk.nk.de, use.adj.pval=F, label.names=T)
+pf <- run_pathfindR(data.frame(Gene.symbol=row.names(bulk.nk.de), logFC=bulk.nk.de$avg_log2FC, adj.P.Val=bulk.nk.de$p_val), p_val_threshold=0.05)
+```
+
+##### Surface Markers
+```{r, message=F, warning=F}
+bulk.nk.de <- FindMarkers(subset(bulk.ab.nk, Tissue=='skin'), ident.1="perilesional", ident.2="healthy", group.by='Lesion', test.use='MAST')
+datatable(round(bulk.nk.de, 3), filter='top', extensions='Buttons', options=list(dom='Bfrtip', buttons=c('copy', 'csv', 'excel', 'pdf', 'print')))
+volcan(bulk.nk.de, use.adj.pval=F, label.names=T)
+```
+
+
+#### PV 
+
+##### PV vs HC
+only lesional vs healthy
+
+###### RNA
+```{r, message=F, warning=F, fig.height=5}
+bulk.nk.pv.de <- FindMarkers(subset(bulk.rna.nk, Tissue=='skin' & Lesion!='perilesional'), ident.1="PV", ident.2="HC", group.by='Health', test.use="DESeq2", slot='counts')
+bulk.nk.pv.de$p_val_adj[is.na(bulk.nk.pv.de$p_val_adj)] = 1; bulk.nk.pv.de$p_val[is.na(bulk.nk.pv.de$p_val)] = 1
+datatable(round(bulk.nk.pv.de, 3), filter='top', extensions='Buttons', options=list(dom='Bfrtip', buttons=c('copy', 'csv', 'excel', 'pdf', 'print')))
+volcan(bulk.nk.pv.de, use.adj.pval=F, label.names=T)
+```
+
+**KEGG Pathways**
+```{r, message=F, warning=F, fig.height=5}
+# pf <- run_pathfindR(data.frame(Gene.symbol=row.names(bulk.nk.pv.de), logFC=bulk.nk.pv.de$avg_log2FC, adj.P.Val=bulk.nk.pv.de$p_val), p_val_threshold=0.05)
+# datatable(pf[grep('killer', pf$Term_Description),])
+# term_gene_heatmap(pf)
+# term_gene_graph(pf)
+# gg_list <- visualize_terms(
+#   result_df = pf,
+#   input_processed = input_processing(data.frame(Gene.symbol=row.names(bulk.nk.pv.de), logFC=bulk.nk.pv.de$avg_log2FC, adj.P.Val=bulk.nk.pv.de$p_val)),
+#   is_KEGG_result = TRUE
+# )
+# print(gg_list$hsa01524)
+# ggplot2::ggsave(
+#   "SkinPV_NKcytotox_diagram.pdf",   # path to output, format is determined by extension
+#   gg_list$hsa04911,         # what to plot
+#   width = 5                 # adjust width
+#   height = 5                # adjust height
+# ) 
+```
+
+**Reactome**
+```{r, message=F, warning=F, fig.height=5}
+# pf <- run_pathfindR(data.frame(Gene.symbol=row.names(bulk.nk.pv.de), logFC=bulk.nk.pv.de$avg_log2FC, adj.P.Val=bulk.nk.pv.de$p_val), p_val_threshold=0.05, gene_sets="Reactome")
+# term_gene_heatmap(pf)
+# term_gene_graph(pf)
+```
+
+**BioCarta**
+```{r, message=F, warning=F, fig.height=5}
+# pf <- run_pathfindR(data.frame(Gene.symbol=row.names(bulk.nk.pv.de), logFC=bulk.nk.pv.de$avg_log2FC, adj.P.Val=bulk.nk.pv.de$p_val), p_val_threshold=0.05, gene_sets="BioCarta")
+# term_gene_heatmap(pf)
+# term_gene_graph(pf)
+```
+
+**GO All**
+```{r, message=F, warning=F, fig.height=5}
+# pf <- run_pathfindR(data.frame(Gene.symbol=row.names(bulk.nk.pv.de), logFC=bulk.nk.pv.de$avg_log2FC, adj.P.Val=bulk.nk.pv.de$p_val), p_val_threshold=0.05, gene_sets="GO-All")
+# term_gene_heatmap(pf)
+# term_gene_graph(pf)
+```
+
+**GO Biological Process**
+```{r, message=F, warning=F, fig.height=5}
+# pf <- run_pathfindR(data.frame(Gene.symbol=row.names(bulk.nk.pv.de), logFC=bulk.nk.pv.de$avg_log2FC, adj.P.Val=bulk.nk.pv.de$p_val), p_val_threshold=0.05, gene_sets="GO-BP")
+# term_gene_heatmap(pf)
+# term_gene_graph(pf)
+```
+
+**GO Molecular Function**
+```{r, message=F, warning=F, fig.height=5}
+# pf <- run_pathfindR(data.frame(Gene.symbol=row.names(bulk.nk.pv.de), logFC=bulk.nk.pv.de$avg_log2FC, adj.P.Val=bulk.nk.pv.de$p_val), p_val_threshold=0.05, gene_sets="GO-MF")
+# term_gene_heatmap(pf)
+# term_gene_graph(pf)
+```
+
+**GO CC**
+```{r, message=F, warning=F, fig.height=5}
+# pf <- run_pathfindR(data.frame(Gene.symbol=row.names(bulk.nk.pv.de), logFC=bulk.nk.pv.de$avg_log2FC, adj.P.Val=bulk.nk.pv.de$p_val), p_val_threshold=0.05, gene_sets="GO-CC")
+# term_gene_heatmap(pf)
+# term_gene_graph(pf)
+```
+
+
+###### Example Heatmaps
+```{r, message=F, warning=F, fig.height=7}
+bulk.nk.de = bulk.nk.pv.de[order(bulk.nk.pv.de$avg_log2FC, decreasing=T),]
+bulk.nk.de$p_val[is.na(bulk.nk.de$p_val)] = 1; bulk.nk.de$p_val_adj[is.na(bulk.nk.de$p_val_adj)] = 1
+DoHeatmap(subset(bulk.rna.nk, Tissue=='skin' & Lesion!='perilesional'), features=row.names(bulk.nk.de[bulk.nk.de$p_val<0.05,]), group.by='Health', slot='counts') + scale_fill_viridis()
+
+so.sub = subset(bulk.rna.nk, Tissue=='skin' & Lesion!='perilesional')
+m = log10(as.matrix(LayerData(so.sub, layer='counts'))[row.names(bulk.nk.de[bulk.nk.de$p_val<0.05,]),]+.1)
+Heatmap(m, col=colorRamp2(log10(c(.1, 10, 1000)), viridis(3)), row_names_gp=gpar(fontsize=8), name='log10(counts)', cluster_columns=cluster_within_group(m, so.sub$Health), show_column_names=F, cluster_rows=F) %v% HeatmapAnnotation(Lesion=so.sub$Lesion, Health=so.sub$Health, Replicate=factor(so.sub$Replicate), col=cols)
+
+so.sub = subset(both.nk, Tissue=='skin' & Lesion!='perilesional' & Health %in% c('PV', 'HC'))
+m = log10(as.matrix(LayerData(so.sub, layer='counts'))[row.names(bulk.nk.de[bulk.nk.de$p_val<0.05,]),]+.1)
+Heatmap(m, col=colorRamp2(log10(c(.1, 10, 1000)), viridis(3)), row_names_gp=gpar(fontsize=8), name='log10(counts)', cluster_columns=cluster_within_group(m, so.sub$Health), show_column_names=F, cluster_rows=F) %v% HeatmapAnnotation(Lesion=so.sub$Lesion, Health=so.sub$Health, Replicate=factor(so.sub$Replicate), col=cols)
+
+DoHeatmap(subset(both.nk, Tissue=='skin' & Lesion!='perilesional' & Health %in% c('PV', 'HC')), features=row.names(bulk.nk.de[bulk.nk.de$p_val<0.05,]), group.by='Health', slot='counts', disp.max=100) + scale_fill_viridis()
+DoHeatmap(subset(bulk.rna.nk, Tissue=='skin' & Lesion!='perilesional' & Health %in% c('PV', 'HC')), features=row.names(bulk.nk.de[bulk.nk.de$p_val<0.05,]), group.by='Health', slot='counts', disp.max=1000) + scale_fill_viridis()
+```
+
+###### Surface Markers
+```{r, message=F, warning=F}
+bulk.nk.de <- FindMarkers(subset(bulk.ab.nk, Tissue=='skin' & Lesion!='perilesional'), ident.1="PV", ident.2="HC", group.by='Health', test.use='MAST')
+datatable(round(bulk.nk.de, 3), filter='top', extensions='Buttons', options=list(dom='Bfrtip', buttons=c('copy', 'csv', 'excel', 'pdf', 'print')))
+volcan(bulk.nk.de, use.adj.pval=F, label.names=T)
+```
+
+
+##### Lesion vs Perilesional (in PV)
+
+###### Venn Diagram via HC
+based on above comparisons between PV lesional vs HC and PV perilesional vs HC (un-adjusted p-value < 5%).
+```{r, message=F, warning=F, fig.width=7, fig.height=3}
+bulk.nk.pv.peri.de <- FindMarkers(subset(bulk.rna.nk, Tissue=='skin' & Lesion!='lesional'), ident.1="PV", ident.2="HC", group.by='Health', test.use="DESeq2", slot='counts')
+
+# svg('sc_skin_nk_lesion_venn.svg', width=4, height=3)
+vennDE(list(lesional=bulk.nk.pv.de, perilesional=bulk.nk.pv.peri.de), title='differentially expressed vs HC')
+# dev.off()
+```
+
+###### RNA
+compared directly
+```{r, message=F, warning=F}
+bulk.nk.de <- FindMarkers(subset(bulk.rna.nk, Tissue=='skin' & Health=='PV'), ident.1="lesional", ident.2="perilesional", group.by='Lesion', test.use="DESeq2")
+datatable(round(bulk.nk.de, 3), filter='top', extensions='Buttons', options=list(dom='Bfrtip', buttons=c('copy', 'csv', 'excel', 'pdf', 'print')))
+volcan(bulk.nk.de, use.adj.pval=F, label.names=T)
+
+bulk.nk.de = bulk.nk.de[order(bulk.nk.de$avg_log2FC),]
+DoHeatmap(subset(bulk.rna.nk, Tissue=='skin' & Health=='PV'), features=row.names(bulk.nk.de[bulk.nk.de$p_val<0.05,]), group.by='Lesion', slot='counts') + scale_fill_viridis()
+
+# DoHeatmap(subset(both.nk, Tissue=='skin' & Health=='PV'), features=row.names(bulk.nk.de[bulk.nk.de$p_val<0.05,]), group.by='Lesion', slot='counts') + scale_fill_viridis()
+```
+
+###### Surface Markers
+compared directly
+```{r, message=F, warning=F}
+bulk.nk.de <- FindMarkers(subset(bulk.ab.nk, Tissue=='skin' & Health=='PV'), ident.1="lesional", ident.2="perilesional", group.by='Lesion', test.use='MAST')
+datatable(round(bulk.nk.de, 3), filter='top', extensions='Buttons', options=list(dom='Bfrtip', buttons=c('copy', 'csv', 'excel', 'pdf', 'print')))
+volcan(bulk.nk.de, use.adj.pval=F, label.names=T)
+```
+
+
+##### PV vs BP
+only lesional
+
+###### RNA
+```{r, message=F, warning=F}
+bulk.nk.de <- FindMarkers(subset(bulk.rna.nk, Tissue=='skin' & Lesion!='perilesional'), ident.1="PV", ident.2="BP", group.by='Health', test.use="DESeq2", min.cells.group=2)
+datatable(round(bulk.nk.de, 3), filter='top', extensions='Buttons', options=list(dom='Bfrtip', buttons=c('copy', 'csv', 'excel', 'pdf', 'print')))
+volcan(bulk.nk.de, use.adj.pval=F, label.names=T)
+```
+
+###### Surface Markers
+```{r, message=F, warning=F}
+bulk.nk.de <- FindMarkers(subset(bulk.ab.nk, Tissue=='skin' & Lesion!='perilesional'), ident.1="PV", ident.2="BP", group.by='Health', test.use='MAST', min.cells.group=2)
+datatable(round(bulk.nk.de, 3), filter='top', extensions='Buttons', options=list(dom='Bfrtip', buttons=c('copy', 'csv', 'excel', 'pdf', 'print')))
+volcan(bulk.nk.de, use.adj.pval=F, label.names=T)
+```
+
+
+##### PV vs PSORI
+only lesional
+
+###### RNA
+```{r, message=F, warning=F}
+bulk.nk.de <- FindMarkers(subset(bulk.rna.nk, Tissue=='skin' & Lesion!='perilesional'), ident.1="PV", ident.2="PSORI", group.by='Health', test.use="DESeq2")
+datatable(round(bulk.nk.de, 3), filter='top', extensions='Buttons', options=list(dom='Bfrtip', buttons=c('copy', 'csv', 'excel', 'pdf', 'print')))
+volcan(bulk.nk.de, use.adj.pval=F, label.names=T)
+```
+
+###### Surface Markers
+```{r, message=F, warning=F}
+bulk.nk.de <- FindMarkers(subset(bulk.ab.nk, Tissue=='skin' & Lesion!='perilesional'), ident.1="PV", ident.2="PSORI", group.by='Health', test.use='MAST')
+datatable(round(bulk.nk.de, 3), filter='top', extensions='Buttons', options=list(dom='Bfrtip', buttons=c('copy', 'csv', 'excel', 'pdf', 'print')))
+volcan(bulk.nk.de, use.adj.pval=F, label.names=T)
+```
+
+
+#### BP
+
+##### BP vs HC
+
+###### RNA
+```{r, message=F, warning=F}
+bulk.nk.bp.de <- FindMarkers(subset(bulk.rna.nk, Tissue=='skin' & Lesion!='perilesional'), ident.1="BP", ident.2="HC", group.by='Health', test.use="DESeq2", min.cells.group=2)
+datatable(round(bulk.nk.bp.de, 3), filter='top', extensions='Buttons', options=list(dom='Bfrtip', buttons=c('copy', 'csv', 'excel', 'pdf', 'print')))
+volcan(bulk.nk.bp.de, use.adj.pval=F, label.names=T)
+```
+
+###### Surface Markers
+```{r, message=F, warning=F}
+bulk.nk.de <- FindMarkers(subset(bulk.ab.nk, Tissue=='skin' & Lesion!='perilesional'), ident.1="BP", ident.2="HC", group.by='Health', test.use='MAST', min.cells.group=2)
+datatable(round(bulk.nk.de, 3), filter='top', extensions='Buttons', options=list(dom='Bfrtip', buttons=c('copy', 'csv', 'excel', 'pdf', 'print')))
+volcan(bulk.nk.de, use.adj.pval=F, label.names=T)
+```
+
+
+#### PSORI
+
+##### PSORI vs HC
+only lesional vs healthy
+
+###### RNA
+```{r, message=F, warning=F}
+bulk.nk.psori.de <- FindMarkers(subset(bulk.rna.nk, Tissue=='skin' & Lesion!='perilesional'), ident.1="PSORI", ident.2="HC", group.by='Health', test.use="DESeq2")
+datatable(round(bulk.nk.psori.de, 3), filter='top', extensions='Buttons', options=list(dom='Bfrtip', buttons=c('copy', 'csv', 'excel', 'pdf', 'print')))
+volcan(bulk.nk.psori.de, use.adj.pval=F, label.names=T)
+```
+
+###### Surface Markers
+```{r, message=F, warning=F}
+bulk.nk.de <- FindMarkers(subset(bulk.ab.nk, Tissue=='skin' & Lesion!='perilesional'), ident.1="PSORI", ident.2="HC", group.by='Health', test.use='MAST')
+datatable(round(bulk.nk.de, 3), filter='top', extensions='Buttons', options=list(dom='Bfrtip', buttons=c('copy', 'csv', 'excel', 'pdf', 'print')))
+volcan(bulk.nk.de, use.adj.pval=F, label.names=T)
+```
+
+
+#### PV / BP / PSORI vs HV
+based on above comparisons between PV/BP/PSORI lesional vs HC (un-adjusted p-value < 5%).
+```{r, message=F, warning=T, fig.width=7, fig.height=5}
+# svg('sc_skin_nk_disease_venn.svg', width=4, height=3)
+vennDE(list(PV=bulk.nk.pv.de, BP=bulk.nk.bp.de, PSORI=bulk.nk.psori.de), title='differentially expressed vs HC')
+# dev.off()
+
+# svg('venn.svg')
+plot(euler(c('PV'=12, 'BP'=17, 'PSORI'=7, 'PV&BP'=4, 'BP&PSORI'=3, 'PSORI&PV'=7, 'PV&BP&PSORI'=9)), quantiles=list('counts'), fills=list(fill=cols$Health))
+# dev.off()
+```
+
+
+### Just in Blood
+
+#### PV vs HC
+
+##### RNA
+```{r, message=F, warning=F}
+bulk.nk.pv.blood.de <- FindMarkers(subset(bulk.rna.nk, Tissue=='pbmc'), ident.1 ="PV", ident.2 ="HC", group.by='Health', test.use="DESeq2")
+datatable(round(bulk.nk.pv.blood.de, 3), filter='top', extensions='Buttons', options=list(dom='Bfrtip', buttons=c('copy', 'csv', 'excel', 'pdf', 'print')))
+volcan(bulk.nk.pv.blood.de, use.adj.pval=F, label.names=T)
+```
+
+##### Surface Markers
+```{r, message=F, warning=F}
+bulk.nk.de <- FindMarkers(subset(bulk.ab.nk, Tissue=='pbmc'), ident.1="PV", ident.2 ="HC", group.by='Health', test.use='MAST')
+datatable(round(bulk.nk.de, 3), filter='top', extensions = 'Buttons', options = list(dom = 'Bfrtip', buttons = c('copy', 'csv', 'excel', 'pdf', 'print')))
+volcan(bulk.nk.de, use.adj.pval=F, label.names=T)
+```
+
+
+#### BP vs HC
+
+##### RNA
+```{r, message=F, warning=F}
+bulk.nk.bp.blood.de <- FindMarkers(subset(bulk.rna.nk, Tissue=='pbmc'), ident.1 ="BP", ident.2 ="HC", group.by='Health', test.use="DESeq2")
+datatable(round(bulk.nk.bp.blood.de, 3), filter='top', extensions='Buttons', options=list(dom='Bfrtip', buttons=c('copy', 'csv', 'excel', 'pdf', 'print')))
+volcan(bulk.nk.bp.blood.de, use.adj.pval=F, label.names=T)
+```
+
+##### Surface Markers
+```{r, message=F, warning=F}
+bulk.nk.de <- FindMarkers(subset(bulk.ab.nk, Tissue=='pbmc'), ident.1="BP", ident.2 ="HC", group.by='Health', test.use='MAST')
+datatable(round(bulk.nk.de, 3), filter='top', extensions = 'Buttons', options = list(dom = 'Bfrtip', buttons = c('copy', 'csv', 'excel', 'pdf', 'print')))
+volcan(bulk.nk.de, use.adj.pval=F, label.names=T)
+```
+
+
+#### PV vs BP
+
+##### RNA
+```{r, message=F, warning=F}
+bulk.nk.de <- FindMarkers(subset(bulk.rna.nk, Tissue=='pbmc'), ident.1="PV", ident.2 ="BP", group.by='Health', test.use="DESeq2")
+datatable(round(bulk.nk.de, 3), filter='top', extensions='Buttons', options=list(dom='Bfrtip', buttons=c('copy', 'csv', 'excel', 'pdf', 'print')))
+volcan(bulk.nk.de, use.adj.pval=F, label.names=T)
+```
+
+##### Surface Markers
+```{r, message=F, warning=F}
+bulk.nk.de <- FindMarkers(subset(bulk.ab.nk, Tissue=='pbmc'), ident.1="PV", ident.2="BP", group.by='Health', test.use='MAST')
+datatable(round(bulk.nk.de, 3), filter='top', extensions = 'Buttons', options = list(dom = 'Bfrtip', buttons = c('copy', 'csv', 'excel', 'pdf', 'print')))
+volcan(bulk.nk.de, use.adj.pval=F, label.names=T)
+```
+
+
+#### PSORI vs HC
+
+##### RNA
+```{r, message=F, warning=F}
+bulk.nk.psori.blood.de <- FindMarkers(subset(bulk.rna.nk, Tissue=='pbmc'), ident.1="PSORI", ident.2="HC", group.by='Health', test.use="DESeq2")
+datatable(round(bulk.nk.psori.blood.de, 3), filter='top', extensions='Buttons', options=list(dom='Bfrtip', buttons=c('copy', 'csv', 'excel', 'pdf', 'print')))
+volcan(bulk.nk.psori.blood.de, use.adj.pval=F, label.names=T)
+```
+
+##### Surface Markers
+```{r, message=F, warning=F}
+bulk.nk.de <- FindMarkers(subset(bulk.ab.nk, Tissue=='pbmc'), ident.1="PSORI", ident.2="HC", group.by='Health', test.use='MAST')
+datatable(round(bulk.nk.de, 3), filter='top', extensions = 'Buttons', options = list(dom = 'Bfrtip', buttons = c('copy', 'csv', 'excel', 'pdf', 'print')))
+volcan(bulk.nk.de, use.adj.pval=F, label.names=T)
+```
+
+
+#### PV vs PSORI
+
+##### RNA
+```{r, message=F, warning=F}
+bulk.nk.de <- FindMarkers(subset(bulk.rna.nk, Tissue=='pbmc'), ident.1="PV", ident.2="PSORI", group.by='Health', test.use="DESeq2")
+datatable(round(bulk.nk.de, 3), filter='top', extensions='Buttons', options=list(dom='Bfrtip', buttons=c('copy', 'csv', 'excel', 'pdf', 'print')))
+volcan(bulk.nk.de, use.adj.pval=F, label.names=T)
+```
+
+##### Surface Markers
+```{r, message=F, warning=F}
+bulk.nk.de <- FindMarkers(subset(bulk.ab.nk, Tissue=='pbmc'), ident.1="PV", ident.2="PSORI", group.by='Health', test.use='MAST')
+datatable(round(bulk.nk.de, 3), filter='top', extensions = 'Buttons', options = list(dom = 'Bfrtip', buttons = c('copy', 'csv', 'excel', 'pdf', 'print')))
+volcan(bulk.nk.de, use.adj.pval=F, label.names=T)
+```
+
+
+#### PV / BP / PSORI vs HC
+based on above comparisons between PV/BP/PSORI vs HC (un-adjusted p-value < 5%).
+```{r, message=F, warning=T, fig.width=7, fig.height=5}
+# svg('sc_blood_nk_disease_venn.svg', width=4, height=3)
+vennDE(results=list(PV=bulk.nk.pv.blood.de, BP=bulk.nk.bp.blood.de, PSORI=bulk.nk.psori.blood.de), title='differentially expressed vs HC')
+# dev.off()
+```
+
+```{r, message=F, warning=T, fig.width=7, fig.height=5}
+# vennDE(results=list(Blood_PV=bulk.nk.pv.blood.de, Blood_BP=bulk.nk.bp.blood.de, Blood_PSORI=bulk.nk.psori.blood.de, Skin_PV=bulk.nk.pv.de, Skin_BP=bulk.nk.bp.de, Skin_PSORI=bulk.nk.psori.de), title='differentially expressed vs HC')
+```
+
+
+### Skin vs Blood
+
+#### RNA
+```{r, message=F, warning=F}
+bulk.nk.de <- FindMarkers(subset(bulk.rna.nk, Lesion!='perilesional'), ident.1="skin", ident.2="pbmc", group.by='Tissue', test.use="DESeq2")
+datatable(round(bulk.nk.de, 3), filter='top', extensions='Buttons', options=list(dom='Bfrtip', buttons=c('copy', 'csv', 'excel', 'pdf', 'print')))
+volcan(bulk.nk.de, use.adj.pval=T, lim.pval=10^-50)
+```
+
+
+#### Surface Markers
+```{r, message=F, warning=F}
+bulk.nk.de <- FindMarkers(subset(bulk.ab.nk, Lesion!='perilesional'), ident.1="skin", ident.2="pbmc", group.by='Tissue', test.use='MAST', assay='AB')
+datatable(round(bulk.nk.de, 3), filter='top', extensions='Buttons', options=list(dom='Bfrtip', buttons=c('copy', 'csv', 'excel', 'pdf', 'print')))
+volcan(bulk.nk.de, use.adj.pval=T, label.names=T)
+```
+
+
+#### Just HC
+
+##### RNA
+```{r, message=F, warning=F}
+bulk.nk.de <- FindMarkers(subset(bulk.rna.nk, Health=='HC'), ident.1="skin", ident.2="pbmc", group.by='Tissue', test.use="DESeq2")
+datatable(round(bulk.nk.de, 3), filter='top', extensions='Buttons', options=list(dom='Bfrtip', buttons=c('copy', 'csv', 'excel', 'pdf', 'print')))
+volcan(bulk.nk.de, use.adj.pval=T, label.names=F, lim.pval=10^-20)
+```
+
+```{r, message=F, warning=F, fig.width=4, fig.height=7}
+both.nk@meta.data$Sample = with(both.nk@meta.data, paste(Tissue, Sample_Name, sep='.'))
+so.c.cells = table(subset(both.nk, Health=='HC')@meta.data$Sample)
+so.c.mark = FindMarkers(subset(bulk.rna.nk, Health=='HC'), ident.1="pbmc", ident.2="skin", group.by='Tissue', test.use="DESeq2", verbose=F, min.pct=0.1)
+so.c.mark = subset(so.c.mark, p_val_adj<0.05 & abs(avg_log2FC)>0)
+
+l2fc = so.c.mark[,"avg_log2FC", drop=F]
+names(l2fc) = 'log2FC'
+padj = so.c.mark[,"p_val_adj", drop=F]
+padj = ifelse(padj<0.001,"***",ifelse(padj<0.01,"**",ifelse(padj<0.05,"*","")))
+
+p1 = Heatmap(l2fc, name="l2FC", column_gap=unit(0, "mm"), border=F, column_names_gp=gpar(fontsize=10), column_names_rot=0, column_names_centered=T,
+             row_names_gp=gpar(fontsize=10), column_title_gp=gpar(fontsize=8), row_title_rot=0, 
+             cluster_rows=T, cluster_columns=F, show_heatmap_legend=F,
+             cell_fun=function(j, i, x, y, w, h, fill) { grid.text(paste0(signif(l2fc[i,j], 2), " ", padj[i,j]), x, y, gp=gpar(fontsize=6)) },
+             col=colorRamp2(c(-2, 0, 2), c("#3344aa", "#eeeeee", "#aa4444")))
+
+pct = so.c.mark[,c("pct.1", "pct.2"), drop=F]
+colnames(pct) = c('pbmc','skin')
+
+p2 = Heatmap(as.matrix(pct), name="pct", column_names_gp=gpar(fontsize=10),
+             row_names_gp=gpar(fontsize=12), column_title_gp=gpar(fontsize=8), column_gap=unit(0, "mm"),
+             cluster_rows=T, cluster_columns=F, row_title_rot=0, border=F, show_heatmap_legend=F,
+             cell_fun=function(j, i, x, y, w, h, fill) { grid.text(signif(pct[i, j], 2), x, y, gp=gpar(fontsize=6)) },
+             col=colorRamp2(c(0, 1), c("#ffffff", "#555555")))
+
+
+avg_expr = data.frame(AverageExpression(subset(both.nk, Health=='HC'), return.seurat=F, assays="RNA", group.by="Sample", slot="data", verbose=F)[[1]])[rownames(so.c.mark), names(so.c.cells), drop=F]
+avg_expr = avg_expr/rowSums(avg_expr, na.rm=T)*100
+
+p3 = Heatmap(as.matrix(avg_expr), name="mean(exp)", row_km=2, row_names_gp=gpar(fontsize=7),
+             cluster_rows=T, cluster_columns=F, show_heatmap_legend=F, column_names_gp=gpar(fontsize=10),
+             column_title_gp=gpar(fontsize=8), column_gap=unit(0, "mm"), row_title_rot=0, border=F,
+             top_annotation=columnAnnotation(cells=anno_barplot(unlist(list(so.c.cells)), height=unit(11, "mm"), border=F, add_numbers=T, axis=F, gp=gpar(fill="#BBBBBB", col='white'))),
+             col=colorRamp2(c(0, max(avg_expr)), c("#ffffee", "#007733")))
+   
+print(p1+p3)
+svg('sc_nk_hc_tissue_heat.svg', width=4, height=7)
+p1+p3
+dev.off()
+```
+
+##### Surface Markers
+```{r, message=F, warning=F}
+bulk.nk.de <- FindMarkers(subset(bulk.ab.nk, Health=='HC'), ident.1="skin", ident.2="pbmc", group.by='Tissue', test.use='MAST')
+datatable(round(bulk.nk.de, 3), filter='top', extensions='Buttons', options=list(dom='Bfrtip', buttons=c('copy', 'csv', 'excel', 'pdf', 'print')))
+volcan(bulk.nk.de, use.adj.pval=F, label.names=T)
+```
+
+
+### PV vs HC across Tissue
+based on above comparisons between PV vs HC in Skin and PBMCs (un-adjusted p-value < 5%).
+```{r, message=F, warning=T, fig.width=7, fig.height=5}
+vennDE(list(Skin=bulk.nk.pv.de, Blood=bulk.nk.pv.blood.de), title='differentially expressed vs HC')
+```
+
+#### RNA
+```{r, message=F, warning=F}
+bulk.nk.de <- FindMarkers(subset(bulk.rna.nk, Lesion!='perilesional'), ident.1="PV", ident.2="HC", group.by='Health', test.use="DESeq2")
+datatable(round(bulk.nk.de, 3), filter='top', extensions='Buttons', options=list(dom='Bfrtip', buttons=c('copy', 'csv', 'excel', 'pdf', 'print')))
+volcan(bulk.nk.de, use.adj.pval=F, label.names=T)
+```
+
+#### Surface Markers
+```{r, message=F, warning=F}
+bulk.nk.de <- FindMarkers(subset(bulk.ab.nk, Lesion!='perilesional'), ident.1="PV", ident.2="HC", group.by='Health', test.use='MAST')
+datatable(round(bulk.nk.de, 3), filter='top', extensions='Buttons', options=list(dom='Bfrtip', buttons=c('copy', 'csv', 'excel', 'pdf', 'print')))
+volcan(bulk.nk.de, use.adj.pval=F)
+```
+
+

@@ -1,0 +1,640 @@
+---
+title: "Skin multi-modal sample integration and reference mapping"
+always_allow_html: yes
+date: "Compiled `r Sys.Date()`"
+output:
+  html_document:
+    toc: yes
+    toc_float: yes
+    toc_depth: 5
+    theme: united
+    code_folding: hide
+    collapse: yes
+    css: max.css
+---
+
+[BACK TO INDEX](./index.html)
+
+```{r, message=F, warning=F}
+set.seed(123)
+knitr::opts_knit$set(progress=F, verbose=F, warning=F, message=F)
+
+subchunkify <- function(g, fig_height=7, fig_width=5) {
+  if(!isTRUE(getOption('knitr.in.progress'))){ print(g); return(); }
+  g_deparsed <- paste0(deparse(function() {g}), collapse='')
+  if(!exists("chunky_id")){ chunky_id <<- 0}
+  chunky_id <<- chunky_id+1
+  sub_chunk <- paste0("\n`","``{r sub_chunky_", chunky_id, ", fig.height=", fig_height, ", fig.width=", fig_width, ", echo=FALSE}",
+  "\n(", g_deparsed, ")()", "\n`","``\n")
+  cat(knitr::knit(text = knitr::knit_expand(text=sub_chunk), quiet=T))
+}
+
+library(Seurat)
+library(tidyverse)
+library(DT)
+library(data.table)
+library(ggplot2)
+library(SeuratDisk)
+library(ggpubr)
+library(rstatix)
+library(celda)
+library(viridis)
+library(ggvenn)
+library(ComplexHeatmap)
+library(circlize)
+library(dplyr)
+library(HGNChelper)
+library(openxlsx)
+library(kableExtra)
+# library(RColorBrewer)
+
+library(future)
+plan("multicore", workers=18)
+
+# dontshow <- sapply(c("dplyr", "HGNChelper", "openxlsx"), library, character.only=T, quietly=T)
+source("gene_sets_prepare.R"); source("sctype_score_.R"); source("auto_detect_tissue_type.R")
+```
+
+# Data Quality
+
+## Meta data information
+```{r}
+meta = read.csv('meta2.csv', sep='\t', header=T, stringsAsFactors=T)
+meta$Health = factor(meta$Health, levels=c('HC', 'PV', 'PSORI', 'BP'), labels=c('HC', 'PV', 'PSORI', 'BP'))
+meta$Origin = factor(paste(meta$Health, meta$Lesion))
+meta = subset(meta, Tissue=='skin')
+datatable(meta)
+meta$PVvsHC = factor(ifelse(meta$Health %in% c('PV', 'HC'), as.character(meta$Health), NA), levels=c('PV', 'HC'))
+meta$BPvsHC = factor(ifelse(meta$Health %in% c('BP', 'HC'), as.character(meta$Health), NA), levels=c('BP', 'HC'))
+meta$PSORIvsHC = factor(ifelse(meta$Health %in% c('PSORI', 'HC'), as.character(meta$Health), NA), levels=c('PSORI', 'HC'))
+```
+
+
+## Filtering samples
+We decided to filter out samples with total Cell count < 8000 and Viability < 70 %.
+BP3 was excluded due to not being measured in the first place due to poor yield.
+
+```{r warning=F}
+counts = fread("data/Combined_S1-forced-skin_RSEC_MolsPerCell.csv", sep=",", header=TRUE) %>% data.frame(row.names=1)
+ex1 = readRDS('archive/Ex1-wta_Seurat.rds')
+ggvenn(list(s1=rownames(counts), ex1=rownames(ex1@meta.data)), auto_scale=T)
+genes = !grepl("pAbO", names(counts)) # select only gene columns
+num_rna = sum(genes==T)
+num_ab = sum(genes==F)
+counts = counts %>% dplyr::rename(VSIR=C10orf54, SCYL1=CCL13, IGHA1=IGHA1_secreted, IGHD=IGHD_membrane,
+                  IGHA1=IGHA1_secreted, IGHG1=IGHG1_secreted, IGHG2=IGHG2_secreted,
+                  IGHG3=IGHG3_secreted, IGHG4=IGHG4_secreted, IGHM=IGHM_secreted,
+                  TRGC1=TARP_refseq, FYB1=FYB, `HLA-A`=HLA.A, `HLA-DMA`=HLA.DMA,
+                  `HLA-DPA1`=HLA.DPA1, `HLA-DQB1`=HLA.DQB1, `HLA-DRA`=HLA.DRA,
+                  `HLA-DR`=HLA.DR.CD74.AHS0035.pAbO, `CD56-1`=CD56.NCAM16.2.NCAM1.AHS0019.pAbO,
+                  CD185=CXCR5.CXCR5.AHS0039.pAbO, CD186=CXCR6.CXCR6.AHS0148.pAbO,
+                  CD357=GITR.TNFRSF18.AHS0104.pAbO, CD366=Tim3.HAVCR2.AHS0016.pAbO,
+                  `CD4-1.pAb0`=CD4.SK3.CD4.AHS0032.pAbO, `CD3-1.pAb0`=CD3.UCHT1.CD3E.AHS0231.pAbO)
+names(counts)[!genes] = gsub('\\..*$', '', names(counts)[!genes]) # rename antibody columns
+
+counts = counts[order(row.names(counts)),]
+skin <- CreateSeuratObject(counts=t(counts[,genes]), assay="RNA")
+skin[['AB']] = CreateAssayObject(counts=t(counts[,!genes]))
+rm(counts)
+
+# original sample calls for each cell
+cell_assign <- fread("data/S1-forced-skin_Sample_Tag_Calls.csv", sep=",", header=TRUE) %>% data.frame(row.names=1)
+cell_assign = cell_assign[order(row.names(cell_assign)),]
+
+# Reads of each sample per cell
+cell_sample_reads <- fread("data/S1-forced-skin_Sample_Tag_ReadsPerCell.csv", sep=",", header=TRUE) %>% data.frame(row.names=1)
+cell_sample_reads = cell_sample_reads[order(row.names(cell_sample_reads)),]
+names(cell_sample_reads) = gsub('\\.stAbO', '', names(cell_sample_reads))
+
+stopifnot(identical(row.names(cell_assign), row.names(cell_sample_reads)))
+
+cell_sample_recalls = data.frame(col=apply(cell_sample_reads, 1, function(r) { which.max(r) }), og_tag=cell_assign$Sample_Tag, og_sample=cell_assign$Sample_Name)
+cell_sample_recalls$Sample_Tag = names(cell_sample_reads)[cell_sample_recalls$col]
+cell_sample_recalls$ratio = apply((cell_sample_reads+1)/colSums(cell_sample_reads), 1, function(r) max(r)/sum(r)) # normalized by total of each sample tag
+cell_sample_recalls$Max_Tag_Reads = apply(cell_sample_reads, 1, max)
+
+# revert SampleTag05 assignments
+cell_sample_recalls$Sample_Tag[cell_sample_recalls$Sample_Tag == 'SampleTag05_hs'] = cell_sample_recalls$og_tag[cell_sample_recalls$Sample_Tag == 'SampleTag05_hs']
+
+cell_sample_recalls = merge(cell_sample_recalls, subset(meta, Run==1), by='Sample_Tag', all.x=T)
+row.names(cell_sample_recalls) = row.names(cell_assign)
+cell_sample_recalls$multiplet = factor(ifelse(cell_sample_recalls$og_sample=='Multiplet', 'multiplet', ifelse(cell_sample_recalls$og_sample=='Undetermined', 'undetermined', 'unique')))
+skin <- AddMetaData(skin, metadata=cell_sample_recalls)
+# skin = subset(skin, !Sample_Name %in% c('Multiplet', 'Undetermined'))
+rm(cell_sample_recalls); rm(cell_sample_reads); rm(cell_assign)
+
+counts = fread("data/Combined_S2-forced_RSEC_MolsPerCell.csv", sep=",", header=TRUE) %>% data.frame(row.names=1)
+ex2 = readRDS('archive/Ex2-wta_Seurat.rds')
+ggvenn(list(s2=rownames(counts), ex2=rownames(ex2@meta.data)), auto_scale=T)
+genes = !grepl("pAbO", names(counts)) # select only gene columns
+counts = counts %>% dplyr::rename(VSIR=C10orf54, SCYL1=CCL13, IGHA1=IGHA1_secreted, IGHD=IGHD_membrane,
+                  IGHA1=IGHA1_secreted, IGHG1=IGHG1_secreted, IGHG2=IGHG2_secreted,
+                  IGHG3=IGHG3_secreted, IGHG4=IGHG4_secreted, IGHM=IGHM_secreted,
+                  TRGC1=TARP_refseq, FYB1=FYB, `HLA-A`=HLA.A, `HLA-DMA`=HLA.DMA,
+                  `HLA-DPA1`=HLA.DPA1, `HLA-DQB1`=HLA.DQB1, `HLA-DRA`=HLA.DRA,
+                  `HLA-DR`=HLA.DR.CD74.AHS0035.pAbO, `CD56-1`=CD56.NCAM16.2.NCAM1.AHS0019.pAbO,
+                  CD185=CXCR5.CXCR5.AHS0039.pAbO, CD186=CXCR6.CXCR6.AHS0148.pAbO,
+                  CD357=GITR.TNFRSF18.AHS0104.pAbO, CD366=Tim3.HAVCR2.AHS0016.pAbO,
+                  `CD4-1.pAb0`=CD4.SK3.CD4.AHS0032.pAbO, `CD3-1.pAb0`=CD3.UCHT1.CD3E.AHS0231.pAbO)
+names(counts)[!genes] = gsub('\\..*$', '', names(counts)[!genes]) # rename antibody columns
+
+counts = counts[order(row.names(counts)),]
+skin2 <- CreateSeuratObject(counts=t(counts[,genes]), assay="RNA")
+skin2[['AB']] = CreateAssayObject(counts=t(counts[,!genes]))
+rm(counts)
+
+cell_assign <- fread("data/S2-forced_Sample_Tag_Calls.csv", sep=",", header=TRUE) %>% data.frame(row.names=1)
+cell_assign = cell_assign[order(row.names(cell_assign)),]
+
+cell_sample_reads <- fread("data/S2-forced_Sample_Tag_ReadsPerCell.csv", sep=",", header=TRUE) %>% data.frame(row.names=1)
+cell_sample_reads = cell_sample_reads[order(row.names(cell_sample_reads)),]
+names(cell_sample_reads) = gsub('\\.stAbO', '', names(cell_sample_reads))
+
+cell_sample_recalls = data.frame(col=apply(cell_sample_reads, 1, function(r) { which.max(r) }))
+cell_sample_recalls$Sample_Tag = names(cell_sample_reads)[cell_sample_recalls$col]
+cell_sample_recalls$ratio = apply(cell_sample_reads, 1, function(r) max(r)/sum(r))
+cell_sample_recalls$og_sample = cell_assign$Sample_Name
+
+cell_sample_recalls = merge(cell_sample_recalls, subset(meta, Run==2), by='Sample_Tag', all.x=T)
+row.names(cell_sample_recalls) = row.names(cell_assign)
+cell_sample_recalls$multiplet = factor(ifelse(cell_sample_recalls$og_sample=='Multiplet', 'multiplet', ifelse(cell_sample_recalls$og_sample=='Undetermined', 'undetermined', 'unique')))
+skin2 <- AddMetaData(skin2, metadata=cell_sample_recalls)
+
+skin <- merge(skin, skin2, add.cell.ids=c('first', 'second'), project='skin')
+# skin = JoinLayers(skin, assay='RNA') %>% JoinLayers(assay='AB')
+filtered_samples = subset(meta, ((!is.na(Cells_total) & Cells_total>8000) | (!is.na(Viability) & Viability>70)) & !(is.na(Viability) & is.na(Cells_total)), select=Sample_Name)
+
+skin <- subset(skin, Sample_Name %in% filtered_samples$Sample_Name)
+rm(cell_sample_recalls); rm(cell_sample_reads); rm(cell_assign)
+
+counts <- LayerData(skin, assay = "RNA", layer = "counts")
+counts <- Matrix::t(Matrix::t(counts)/Matrix::colSums(counts)) * 100
+most_expressed <- order(apply(counts, 1, median), decreasing = T)[10:1]
+boxplot(as.matrix(t(counts[most_expressed, ])), cex = 0.1, las = 1, xlab = "% total count per cell",
+    col = rainbow(length(most_expressed)), horizontal=T, main='top transcripts')
+
+counts <- LayerData(skin, assay = "AB", layer = "counts")
+counts <- Matrix::t(Matrix::t(counts)/Matrix::colSums(counts)) * 100
+most_expressed <- order(apply(counts, 1, median), decreasing = T)[10:1]
+boxplot(as.matrix(t(counts[most_expressed, ])), cex = 0.1, las = 1, xlab = "% total count per cell",
+    col = rainbow(length(most_expressed)), horizontal=T, main='top surface markers')
+
+skin@meta.data$Health = factor(skin@meta.data$Health, levels=c('HC', 'PV', 'PSORI', 'BP'), labels=c('HC', 'PV', 'PSORI', 'BP'))
+```
+
+
+## Cell Quality & Multiplets
+Ideally, cells should have a large number of reads overall (x-axis) and fairly broad coverage of a large number of genes (y-axis).
+Cells with few detected genes (bottom) make normalization and imputation hard to impossible.
+We can use minimal thresholds (red dashed lines) for number of genes and number of overall reads to exclude low quality cells.
+```{r, fig.width=9, fig.height=9, warning=F}
+feature_min = 10
+read_min = 10
+ratio_min = 0.5
+ggplot(skin@meta.data, aes(x=nCount_RNA, y=nFeature_RNA, color=multiplet, alpha=ratio)) +
+  geom_point(shape=16, size=1) + scale_color_manual(values=list(undetermined='orange', multiplet='red', unique='navy')) +
+  scale_alpha(range=c(0.8, 0.1)) + scale_x_log10()  + theme_classic() +
+  geom_hline(yintercept=feature_min, color='red', lty='dashed') +
+  geom_vline(xintercept=read_min, color='red', lty='dashed') +
+  facet_wrap(~Sample_Name, ncol=3)
+```
+
+Notably, multiplets are scattered throughout the distribution.
+I assume uniquely identified cells also just contain reads from one sample tags, whereas remaining multiplets count reads from two or more tags that we cannot disentangle at this point.
+
+```{r, fig.width=11, fig.height=5}
+ggplot(skin@meta.data, aes(color=Sample_Name, x=nCount_RNA, fill=Sample_Name)) +
+   geom_density(alpha=0.2) + scale_x_log10() + theme_classic() +
+   geom_vline(xintercept=read_min, color='red', lty='dashed') + facet_wrap(~multiplet, ncol=1) +
+   labs(title='UMI counts per cell', y='cell density') + scale_y_continuous(expand=c(0,0)) +
+
+   ggplot(skin@meta.data, aes(color=Sample_Name, x=nFeature_RNA, fill=Sample_Name)) +
+   geom_density(alpha=0.2) + scale_x_log10() + theme_classic() +
+   labs(y="Cell density", title='Genes per cell') + facet_wrap(~multiplet, ncol=1) +
+   geom_vline(xintercept=feature_min, color='red', lty='dashed') + scale_y_continuous(expand=c(0,0)) + theme(legend.position='none')
+```
+
+### Multiplet recovery
+Based on the most prominent sample tag per cell, multiplets could be "rescued".
+When plotting the ratio of the most prominent sample tag among all reads, we see that most multiplets are dominated by one tag.
+```{r, fig.width=11, fig.height=5, warning=F}
+ggplot(subset(skin@meta.data, multiplet!='undetermined'), aes(x=nCount_RNA, y=ratio, color=factor(Replicate)), alpha=0.1) +
+  geom_point(shape=16, size=1) +
+  scale_x_log10() + theme_classic() +
+  geom_vline(xintercept=read_min, color='red', lty='dashed') +
+   geom_hline(yintercept=ratio_min, color='red', lty='dashed') +
+  facet_grid(vars(multiplet), vars(Health))
+```
+
+Including cells with at least the absolute majority of one sample (50% of tags) seems feasible but poses the risk of introducing "heterogenous" (more variable) cells to the analysis and muddling the clustering.
+Note that some of the uniquely identified cells also contain more than 50% other sample tags.
+
+```{r, fig.width=11, fig.height=5}
+p1 = ggplot(skin@meta.data, aes(x=factor(Sample_Name), fill=Sample_Name, alpha=multiplet)) + scale_alpha_ordinal(range=c(0.5, 1)) +
+   facet_grid(rows=vars(Run), labeller = label_wrap_gen(width=16, multi_line=F), scales="free", space="free") +
+   geom_bar(show.legend=F) + coord_flip() + labs(y='# cells', x='', title='Cells per sample (+ multiplet rescue)') + theme_classic()# + scale_fill_manual(values=as.vector(t(cbind(rev(viridis(6)), plasma(6)))))
+
+p2 = ggplot(subset(skin@meta.data, multiplet!='unique'), aes(x=og_sample, alpha=multiplet)) + scale_alpha_ordinal(range=c(0.7, 0.8))+
+   geom_bar(aes(fill=Sample_Name), show.legend=F) + labs(y='# cells', x='', title='Cells per sample') + theme_classic()# + scale_fill_manual(values=as.vector(t(cbind(rev(viridis(6)), plasma(6)))))
+
+ggarrange(p1, p2, widths=c(3,1))
+```
+
+# Multimodal Sample Integration
+
+## Without sample integration
+(no batch removal)
+```{r, echo=F, warning=F, message=F}
+skin = subset(skin, subset=Run>0)
+skin <- subset(skin, subset=(nFeature_RNA >= feature_min) & (nCount_RNA >= read_min))# & ABcontamination < 0.75) #ratio > 0.5  & skin$multiplet=='unique'
+
+DefaultAssay(skin) <- "RNA"
+skin = skin %>%
+   NormalizeData(verbose=F) %>%
+   FindVariableFeatures(verbose=F) %>%
+   ScaleData() %>%
+   RunPCA(reduction.name='rna.pca', reduction.key="rnaPC_", npcs=35, approx=F, verbose=F)
+
+DefaultAssay(skin) <- "AB"
+skin = skin %>%
+   NormalizeData(normalization.method="CLR", margin=2, verbose=F) %>%
+   FindVariableFeatures(verbose=F) %>%
+   ScaleData() %>%
+   RunPCA(reduction.name='ab.pca', reduction.key="abPC_", npcs=25, approx=F, verbose=F) %>%
+   FindMultiModalNeighbors(reduction.list=list("rna.pca", "ab.pca"), dims.list=list(1:35, 1:20),
+                            knn.graph.name="wknn", snn.graph.name="wsnn", weighted.nn.name='w.nn', verbose=F) %>%
+   RunUMAP(reduction.name="wUMAP", verbose=F, nn.name="w.nn", reduction.key='umap')
+
+DimPlot(skin, reduction = "wUMAP", group.by="Run")
+```
+
+## Integrated multimodal assays and two runs
+```{r, echo=F, warning=F, message=F}
+skin.split <- SplitObject(skin, split.by="Run")
+
+skin.split <- lapply(skin.split, function(x) {
+   DefaultAssay(x) <- "RNA"
+   x <- x %>%
+      NormalizeData(verbose=F) %>%
+      FindVariableFeatures(verbose=F)
+})
+features.RNA <- SelectIntegrationFeatures(object.list=skin.split, assay=rep("RNA", length(skin.split)), verbose=F)
+anchors.RNA <- FindIntegrationAnchors(object.list=skin.split, assay=rep("RNA", length(skin.split)), anchor.features=features.RNA, verbose=F)
+
+skin.split <- lapply(skin.split, function(x) {
+   DefaultAssay(x) <- "AB"
+   x <- NormalizeData(x, verbose=F, normalization.method='CLR', margin=2) %>% # using CLR for surface proteins as described in the seurat tutorial (e.g. https://satijalab.org/seurat/articles/multimodal_vignette.html)
+      FindVariableFeatures(verbose=F) #selection.method = "vst", nfeatures = 2000)
+})
+features.AB <- SelectIntegrationFeatures(object.list=skin.split, assay=rep("AB",length(skin.split)), verbose=F)
+anchors.AB <- FindIntegrationAnchors(object.list=skin.split, assay=rep("AB", length(skin.split)), anchor.features=features.AB, dims=1:(length(features.AB)-5), max.features=length(features.AB)-5, verbose=F)
+
+skin.combined <- IntegrateData(new.assay.name="iRNA", anchorset = anchors.RNA, verbose=F)
+skin.combined.AB <- IntegrateData(new.assay.name="iAB", anchorset = anchors.AB, dims=1:(length(features.AB)-5), verbose=F)
+
+skin.combined[["iAB"]] <- skin.combined.AB@assays$iAB
+
+DefaultAssay(skin.combined) <- "iRNA"
+skin.combined <- ScaleData(skin.combined, verbose=F) %>% # features = rownames(skin.combined)
+   RunPCA(reduction.name='iRNA.pca', reduction.key="iRNA.PC_", npcs=num_rna , approx=F, verbose=F)
+
+DefaultAssay(skin.combined) <- "iAB"
+skin.combined <- ScaleData(skin.combined, features = rownames(skin.combined), verbose=F) %>%
+   RunPCA(reduction.name='iAB.pca', reduction.key="iAB.PC_", npcs=num_ab, approx=F, verbose=F)
+
+DefaultAssay(skin.combined) <- "iRNA"
+
+# generate the UMAP on the integrated data
+skin <- skin.combined %>%
+   FindNeighbors(reduction='iRNA.pca', dims=1:30, graph.name=c('rna.nn', 'rna.snn'), do.plot=T, verbose=F) %>%
+   FindClusters(graph.name="rna.snn", algorithm=3, resolution=0.05, verbose=F) %>%
+   RunUMAP(reduction = 'iRNA.pca', dims = 1:100, assay = NULL, reduction.name = 'iRNA.umap', reduction.key = 'iRNA.UMAP_', verbose=F) %>%
+   FindNeighbors(reduction='iAB.pca', dims=1:20, graph.name=c('ab.nn', 'ab.snn'), do.plot=T, verbose=F) %>%
+   FindClusters(graph.name="ab.snn", algorithm=3, resolution=0.1, verbose=F) %>%
+   RunUMAP(reduction = 'iAB.pca', dims = 1:num_ab, assay = NULL, reduction.name = 'iAB.umap', reduction.key = 'iAB.UMAP_', verbose=F) %>%
+   FindMultiModalNeighbors(reduction.list = list("iRNA.pca", "iAB.pca"), knn.graph.name = "integrated.wknn", snn.graph.name = "integrated.wsnn", weighted.nn.name='integrated.w.nn', dims.list = list(1:100, 1:num_ab), verbose=F) %>%
+   FindClusters(graph.name="integrated.wsnn", algorithm=3, resolution=0.04, verbose=F) %>%
+   RunUMAP(nn.name="integrated.w.nn", reduction.name="iWUMAP", reduction.key="iWUMAP_", verbose=F)
+
+DimPlot(skin, reduction = "iWUMAP", group.by="Run")
+
+skin@meta.data$cluster = skin@meta.data$integrated.wsnn_res.0.04
+
+skin <- skin %>% FindSubCluster(cluster='3', subcluster.name='subclust3', resolution=0.3, algorithm=3, graph.name="integrated.wknn") %>%
+   FindSubCluster(cluster='0', subcluster.name='subclust0', resolution=0.5, algorithm=3, graph.name="integrated.wknn")
+# DimPlot(skin, reduction = "iWUMAP", group.by='subclust2')
+# DimPlot(skin, reduction = "iWUMAP", group.by='subclust3')
+skin@meta.data$subcluster = as.character(skin@meta.data$integrated.wsnn_res.0.04)
+skin@meta.data$subcluster[skin@meta.data$subcluster=='0'] = skin@meta.data$subclust0[skin@meta.data$subcluster=='0']
+skin@meta.data$subcluster[skin@meta.data$subcluster=='3'] = skin@meta.data$subclust3[skin@meta.data$subcluster=='3']
+skin@meta.data$subcluster = factor(skin@meta.data$subcluster)
+skin@meta.data$cluster_orig = skin@meta.data$cluster
+# skin@meta.data$cluster = skin@meta.data$subcluster
+Idents(skin) = skin@meta.data$cluster
+```
+### by Surface Markers
+```{r, fig.width=7, fig.height=6}
+DimPlot(skin, reduction="iAB.umap", group.by="ab.snn_res.0.1", label=T, label.size=3, repel=T)
+```
+
+### by Transcripts
+```{r, fig.width=7, fig.height=6, warning=F}
+DimPlot(skin, reduction="iRNA.umap", group.by="rna.snn_res.0.05", label=T, label.size=3, repel=T)
+```
+
+### Intetrated weighted multimodal UMAP
+```{r, fig.width=6, fig.height=6, warning=F}
+DimPlot(skin, reduction="iWUMAP", group.by="cluster", label=T, label.size=3, repel=T)
+```
+
+### Subclustering of 2 & 3
+```{r, fig.width=6, fig.height=6, warning=F}
+DimPlot(skin, reduction="iWUMAP", group.by="subcluster", label=T, label.size=3, repel=T)
+```
+
+
+# Reference mapping
+
+## To published skin rash data
+[RashX article](https://doi.org/10.1126/sciimmunol.abl9165)
+
+```{r, include=T, eval=T, warning=F, message=F}
+ref.skin <- readRDS("reference/SI_Bangert.rds")
+ref.skin = Seurat::UpdateSeuratObject(ref.skin)
+# DimPlot(ref.skin, reduction="umap", group.by="Ident2", label=T, label.size=3, repel=T, raster=F) + NoLegend()
+genes = row.names(LayerData(skin, assay="RNA"))
+ABs = row.names(LayerData(skin, assay="AB"))
+ref.skin.genes = row.names(LayerData(ref.skin, assay="RNA"))
+ref.skin.ABs = row.names(LayerData(ref.skin, assay="ADT"))
+```
+
+Surface markers missing in the reference data
+```{r}
+ggvenn::ggvenn(list(our=ABs, ref.skin=ref.skin.ABs))
+# ABs[ABs %in% ref.skin.ABs]
+# ABs[!ABs %in% ref.skin.ABs]
+ref.skin.ABs[!ref.skin.ABs %in% ABs]
+```
+
+Transcripts missing in the reference data
+```{r}
+ggvenn::ggvenn(list(our=genes, ref.skin=ref.skin.genes))
+genes[!genes %in% ref.skin.genes]
+```
+
+```{r, include=T, eval=T, warning=F, message=F}
+skin = SCTransform(skin, verbose=F)
+ref.skin = SCTransform(ref.skin, verbose=F)
+anchors <- FindTransferAnchors(reference=ref.skin, query=skin, normalization.method="SCT",
+                               reference.reduction="spca", dims=1:50, verbose=T)
+skin <- MapQuery(anchorset=anchors, query=skin, reference=ref.skin, new.reduction.name='ref.skin.umap',
+               refdata=list(skin="Ident2"), reference.reduction="spca", reduction.model="umap", verbose=F)
+DimPlot(skin, reduction="iWUMAP", group.by="predicted.skin", label=T, label.size=3, repel=T, shuffle=T, alpha=0.5)
+rm(ref.skin); gc()
+
+### Cell type composition based on reference mapping
+ggplot(skin@meta.data, aes(x=Sample_Name, fill=predicted.skin)) + geom_bar(position='fill') + 
+   facet_grid(rows=vars(Health), labeller = label_wrap_gen(width=16, multi_line=F), scales="free", space="free") +
+   theme_classic() + coord_flip()
+```
+
+## scType classification
+```{r, fig.width=11, fig.height=8, warning=F, message=F}
+# get cell-type-specific gene sets from our in-built database (DB)
+db_ = "reference/ScTypeDB_full.xlsx"
+gs_list = gene_sets_prepare(db_, "Immune system") # e.g. Immune system, Pancreas, Liver, Eye, Kidney, Brain, Lung, Adrenal, Heart, Intestine, Muscle, Placenta, Spleen, Stomach, Thymus
+
+es.max = sctype_score(scRNAseqData=skin@assays$iRNA@scale.data, scaled=T, gs=gs_list$gs_positive, gs2=gs_list$gs_negative)
+skin@meta.data$scType = factor(row.names(es.max)[apply(es.max, 2, which.max)], levels=row.names(es.max), ordered=T)
+skin@meta.data$scCat = factor(skin@meta.data$scType, levels=row.names(es.max), labels=c('B', 'B', 'B', 'B', 'B', 'T', 'T', 'T', 'T', 'T', 'T', 'T', 'T', 'T', 'NK', 'Eso', 'Neutro', 'Baso', 'Mast', 'Mono', 'Mono', 'Mono', 'Macro', 'other', 'other', 'other', 'other', 'other', 'other', 'other', 'other', 'other', 'other'), ordered=T)
+normscale = function(x){(x-min(x))/(max(x)-min(x))}
+skin@meta.data$scType.score = normscale(apply(es.max, 2, max))
+skin@meta.data$scType.quality = normscale(apply(es.max, 2, function(x){max(x)/abs(sum(x)-max(x))}))
+```
+
+## To reference PBMC dataset
+[Seurat v4 reference for multimodal PBMC](https://satijalab.org/seurat/articles/multimodal_reference_mapping.html)
+
+[original article](https://doi.org/10.1016/j.cell.2021.04.048)
+
+```{r, include=T, eval=T, warning=F, message=F}
+ref <- LoadH5Seurat("reference/pbmc_multimodal.h5seurat", verbose=F)
+ref@meta.data$celltype = ref@meta.data$celltype.l1
+ref@meta.data$celltype[ref@meta.data$celltype == 'NK'] = ref@meta.data$celltype.l2[ref@meta.data$celltype == 'NK']
+ref@meta.data$celltype[ref@meta.data$celltype.l2 == 'ILC'] = 'ILC'
+# DimPlot(ref, reduction="wnn.umap", group.by="celltype.l2", label=T, label.size=3, repel=T, raster=F) + NoLegend()
+ref.genes = row.names(LayerData(ref, assay="SCT"))
+ref.ABs = row.names(LayerData(ref, assay="ADT"))
+```
+
+
+Surface markers missing in the reference data
+```{r}
+ggvenn::ggvenn(list(our=ABs, ref.skin=ref.ABs))
+ABs[!ABs %in% ref.ABs]
+```
+
+Transcripts missing in the reference data
+```{r}
+ggvenn::ggvenn(list(our=genes, ref.skin=ref.genes))
+genes[!genes %in% ref.genes]
+```
+
+```{r, include=T, eval=T, warning=F, message=F}
+skin = SCTransform(skin, verbose=F, assay='RNA')
+ref.anchors <- FindTransferAnchors(reference=ref, query=skin, normalization.method="SCT",
+                               reference.reduction="spca", dims=1:50, verbose=F)
+skin <- MapQuery(anchorset=ref.anchors, query=skin, reference=ref, new.reduction.name='ref.pbmc.umap',
+               refdata=list(pbmc.l1="celltype.l1", pbmc.l2="celltype.l2", pbmc.l3="celltype.l3", pbmc="celltype"),
+               reference.reduction="spca", reduction.model="wnn.umap", verbose=F)
+rm(ref); nopprint = gc(verbose=F)
+DefaultAssay(skin) <- 'RNA'
+# skin[['SCT']] <- NULL
+# skin[['iRNA']] <- NULL
+# skin[['iAB']] <- NULL
+skin[['prediction.score.pbmc.l1']] <- NULL
+skin[['prediction.score.pbmc.l2']] <- NULL
+skin[['prediction.score.pbmc.l3']] <- NULL
+```
+
+### Cell type composition based on reference mapping
+```{r, fig.width=13, fig.height=4, warning=F}
+ggplot(skin@meta.data, aes(x=Sample_Name, fill=predicted.pbmc)) + geom_bar(position='fill') + 
+   facet_grid(rows=vars(Health), labeller = label_wrap_gen(width=16, multi_line=F), scales="free", space="free") +
+   theme_classic() + coord_flip()
+
+ggplot(skin@meta.data, aes(x=Sample_Name, fill=predicted.pbmc.l1)) + geom_bar(position='fill') + 
+   facet_grid(rows=vars(Health), labeller = label_wrap_gen(width=16, multi_line=F), scales="free", space="free") +
+   theme_classic() + coord_flip()
+
+ggplot(skin@meta.data, aes(x=Sample_Name, fill=predicted.pbmc.l1)) + geom_bar(position='fill') + 
+   facet_grid(rows=vars(Health), cols=vars(Run), labeller = label_wrap_gen(width=16, multi_line=F), scales="free", space="free") +
+   theme_classic() + coord_flip()
+
+ggplot(skin@meta.data, aes(x=Sample_Name, fill=predicted.pbmc.l2)) + geom_bar(position='fill') + 
+   facet_grid(rows=vars(Health), labeller = label_wrap_gen(width=16, multi_line=F), scales="free", space="free") +
+   theme_classic() + coord_flip() + scale_fill_manual(values=as.vector(t(cbind(viridis(15), rev(plasma(15))))))
+```
+
+
+# Statistical Analysis
+For further analysis, RNA transcripts and surface markers were normalized, and reduced by PCA individually.
+Afterwards, clusters are computed based on multimodal neighbors and represented by UMAP reduction.
+Almost all features were found to be highly variable.
+The tables show strongest regulated gene and surface marker per cluster (both positive and negative)
+
+
+## Clusters
+Based on multi modal model above.
+```{r, fig.width=9, fig.height=3.5}
+ggplot(skin@meta.data, aes(x=Sample_Name, fill=cluster)) + geom_bar(position='fill') + 
+   facet_grid(rows=vars(Health), labeller=label_wrap_gen(width=16, multi_line=F), scales="free", space="free") +
+   theme_classic() + coord_flip()
+
+ggplot(skin@meta.data, aes(x=Sample_Name, fill=cluster)) + geom_bar(position='fill') + 
+   facet_grid(rows=vars(Health), cols=vars(Run), labeller=label_wrap_gen(width=16, multi_line=F), scales="free", space="free") +
+   theme_classic() + coord_flip()
+```
+
+### Reference celltypes in our UMAP
+Reference mapping of cell types (left) and subtypes (rights) within combined (AB+RNA) Weighted Nearest Neighbor UMAP coordinates in PBMC dataset.
+```{r, fig.width=11, fig.height=5, warning=F}
+DimPlot(skin, reduction="iWUMAP", group.by="predicted.pbmc", label=T, label.size=3, repel=T)
+
+p1 = DimPlot(skin, reduction="iWUMAP", group.by="predicted.pbmc.l1", label=T, label.size=3, repel=T)
+p2 = DimPlot(skin, reduction="iWUMAP", group.by="predicted.pbmc.l2", label=T, label.size=3 ,repel=T) + NoLegend()
+p1 + p2
+
+DimPlot(skin, reduction="iWUMAP", group.by="predicted.pbmc.l3", label=T, label.size=3, repel=T)
+```
+
+### Annotation based on References
+```{r, fig.width=9, fig.height=5}
+skin@meta.data$annotation = factor(skin@meta.data$cluster, levels=0:8, labels=c('C1 (CD4+ T)', 'C2 (CD8+ T)', 'C3 (mixed)', 'C4 (NK & ILC)', 'C5 (cDC2 & CD14 Mono)', 'C6 (other T & ILC)', 'C7 (mixed)', 'C8 (B)', 'C9 (Mono)'))
+
+ggplot(skin@meta.data, aes(x=annotation, fill=predicted.pbmc)) + geom_bar(position='fill') + 
+   theme_classic() + coord_flip()
+
+ggplot(skin@meta.data, aes(x=annotation, fill=predicted.skin)) + geom_bar(position='fill') + 
+   theme_classic() + coord_flip()
+
+ggplot(skin@meta.data, aes(x=annotation, fill=scCat)) + geom_bar(position='fill') + 
+   theme_classic() + coord_flip()
+
+skin@meta.data$subannotation = factor(skin@meta.data$subcluster, labels=c('C1_1 (CD4+ T: Tmm3 Trm2)', 'C1_2 (CD4+ T: Treg)', 'C1_3 (CD4+ T: mixed)', 'C1_4 (CD4+ T: mixed)', 'C1_5 (CD4+ T: mixed)', 'C1_6 (CD4+ T: MAIT)', 'C2 (CD8+ T)', 'C3 (mixed)', 'C4 (NK1)', 'C4 (NK2)', 'C4 (NK3)', 'C4 (NK4)', 'C5 (DC)', 'C6 (other T & ILC)', 'C7 (CD4+ & CD8+ T)', 'C8 (B)', 'C9 (Mono)'))
+
+ggplot(subset(skin@meta.data, cluster==0), aes(x=subannotation, fill=predicted.pbmc.l2)) + geom_bar(position='fill') + 
+   theme_classic() + coord_flip()
+
+ggplot(subset(skin@meta.data, cluster==0), aes(x=subannotation, fill=predicted.skin)) + geom_bar(position='fill') + 
+   theme_classic() + coord_flip()
+
+ggplot(subset(skin@meta.data, cluster==0), aes(x=subannotation, fill=scCat)) + geom_bar(position='fill') + 
+   theme_classic() + coord_flip()
+
+ggplot(subset(skin@meta.data, cluster==3), aes(x=subannotation, fill=predicted.pbmc.l3)) + geom_bar(position='fill') + 
+   theme_classic() + coord_flip()
+
+ggplot(subset(skin@meta.data, cluster==3), aes(x=subannotation, fill=predicted.skin)) + geom_bar(position='fill') + 
+   theme_classic() + coord_flip()
+
+ggplot(subset(skin@meta.data, cluster==3), aes(x=subannotation, fill=scCat)) + geom_bar(position='fill') + 
+   theme_classic() + coord_flip()
+```
+
+
+# Further statistical analysis
+NEXT: [skin analysis](./sc_skin_analysis.html)
+
+
+# Interactive visualization
+```{r}
+# thresh = apply(skin@assays$AB@data, 1, function(x) {mean(quantile(x, c(0.1, 0.9)))})
+# expressed = data.frame(t(apply(skin@assays$AB@data, 2, function(c) { c>thresh })))
+skin = JoinLayers(skin, assay='RNA')
+d = LayerData(skin, assay = "iAB", layer = "data")
+tr = LayerData(skin, assay="RNA", layer="count")
+skin@meta.data$manual_other = d['CD4-1',] > 1 | d['CD3-1',] > 1.75 | d['CD8',] > 1 | d['CD11c',] > 2 | d['CD19',] > 1
+skin@meta.data$manual_NK = factor(ifelse(!skin@meta.data$manual_other & (d['CD56-1',] > 0.5 & d['CD16',] > 0.5), 'NK', 'other'))
+skin@meta.data$manual_ILC = factor(ifelse(!skin@meta.data$manual_other & (d['CD127',] > 1 & d['CD161',] > 1), 'ILC', 'other'))
+skin@meta.data$refNK = factor(ifelse(skin@meta.data$predicted.pbmc.l1=='NK', 'NK', ifelse(skin@meta.data$predicted.pbmc.l2=='ILC', 'ILC', NA)))
+skin@meta.data$refNKbright = factor(ifelse(skin@meta.data$predicted.pbmc.l2=='NK', 'NK', ifelse(skin@meta.data$predicted.pbmc.l2=='NK_CD56bright', 'NK bright', ifelse(skin@meta.data$predicted.pbmc.l2=='ILC', 'ILC', NA))))
+
+# d = LayerData(skin, assay="AB", layer="data")
+
+skin@meta.data$CD4.gated = factor(ifelse(d['CD4-1',] > 1 & d['CD3-1',] > 1.75 & d['CD8',] < 1 & d['CD11c',] < 2, 'CD4 gated', 'other'))
+skin@meta.data$Tcell = factor(ifelse(d['CD3-1',] > 1.75 & d['CD14',] < 0.5 & d['CD11c',] < 2 & d['CD19',] < 0.5 & d['IgD',] < 1 & d['IgM',] < 1, 'T cell', 'other'))
+skin@meta.data$Tfh = factor(ifelse(skin@meta.data$CD4.gated=='CD4 gated' & d['CD278',] > 0.1 & d['CD279',] > 0.1, 'Tfh like', 'other'))
+# skin@meta.data$Tfh = factor(ifelse(d['CD4-1',] > 1 & tr['CXCL13',] > 0 & d['CD278',] > 0.1 & d['CD279',] > 0.1, 'Tfh', 'other'))
+skin@meta.data$CXCL13 = factor(ifelse(tr['CXCL13',] > 0, 'CXCL13', 'other'))
+skin@meta.data$CD4 = factor(ifelse(skin@meta.data$cluster_orig==0, 'CD4 clustered', 'other'))
+
+skin.cd4 = subset(skin, CD4.gated=='CD4 gated') %>%
+   FindVariableFeatures(verbose=F, assay='iRNA') %>%
+   ScaleData(verbose=F, assay='iRNA') %>%
+   RunPCA(verbose=F, assay='iRNA', reduction.name='iRNA.pca') %>%
+   FindVariableFeatures(verbose=F, assay='AB') %>%
+   ScaleData(verbose=F, assay='iAB') %>%
+   RunPCA(verbose=F, assay='iAB', reduction.name='iAB.pca') %>%
+   FindMultiModalNeighbors(reduction.list=list('iRNA.pca', 'iAB.pca'), dims.list=list(1:30, 1:(nrow(skin[['AB']])-1)), verbose=F, weighted.nn.name='wnn') %>%
+   RunUMAP(nn.name='wnn', reduction.name='sub.iwumap', reduction.key='iwUMAP_', verbose=F) %>%
+   FindClusters(graph.name='wsnn', algorithm=3, resolution=0.1, verbose=F, cluster.name='CD4.gated.subcluster')
+
+#skin.cd4@meta.data$CD4.gated.subannotation = factor(skin.cd4@meta.data$CD4.gated.subcluster, labels=paste('skin', c('CD4_1 (Tmm3 Trm2)', 'CD4_2 (CD8 MAIT Trm3)', 'CD4_3 (Treg)', 'CD4_4 (NK gdT cDC)', 'CD4_5 (mix)', 'CD4_6 (mix)', 'CD4_7 (B)')))
+skin.cd4@meta.data$CD4.gated.subannotation = factor(skin.cd4@meta.data$CD4.gated.subcluster, labels=c('CD4_1 (Tmm3 Trm2)', 'CD4_2 (CD8 MAIT Trm3)', 'CD4_3 (Treg)', 'CD4_4 (CD4 mix)', 'CD4_5 (NK gdT)', 'CD4_6 (cDC)', 'CD4_7 (CD4 mix)', 'CD4_8 (B)'))
+
+
+tab = with(subset(skin.cd4@meta.data), table(CD4.gated.subcluster, predicted.pbmc.l2))
+perc = tab/rowSums(tab, na.rm=T)
+sel = apply(perc, 2, max, na.rm=T)>.01
+cbind(tab[,sel], rowSums(tab)) %>% kbl(col.names=c('# cells', colnames(tab)[sel], 'Σ')) %>% kable_classic(full_width=F)
+round(perc[,sel]*100, 1) %>% kbl(col.names=c('%', colnames(tab)[sel])) %>% kable_classic(full_width=F)
+
+# DimPlot(skin.cd4, reduction="sub.iwumap", group.by='CD4.gated.subannotation', label=F, label.size=3, repel=T, shuffle=T, alpha=0.5)
+# skin.cd4@meta.data$CD4.gated.subannotation = factor(paste('skin', skin.cd4@meta.data$CD4.gated.subcluster))
+
+skin@meta.data$CD4.gated.subcluster = 'not CD4'
+skin@meta.data[rownames(skin.cd4@meta.data), ]$CD4.gated.subcluster = skin.cd4@meta.data$CD4.gated.subcluster
+skin@meta.data$CD4.gated.subcluster = factor(skin@meta.data$CD4.gated.subcluster)
+
+skin@meta.data$CD4.gated.subannotation = 'not CD4'
+skin@meta.data[rownames(skin.cd4@meta.data), ]$CD4.gated.subannotation = as.character(skin.cd4@meta.data$CD4.gated.subannotation)
+skin@meta.data$CD4.gated.subannotation = factor(skin@meta.data$CD4.gated.subannotation)
+                                   
+saveRDS(skin.cd4, 'data/skin.cd4.gated.RDS')
+
+
+skin.t = subset(skin, Tcell=='T cell') %>%
+   FindVariableFeatures(verbose=F, assay='iRNA') %>%
+   ScaleData(verbose=F, assay='iRNA') %>%
+   RunPCA(verbose=F, assay='iRNA', reduction.name='iRNA.pca') %>%
+   FindVariableFeatures(verbose=F, assay='iAB') %>%
+   ScaleData(verbose=F, assay='iAB') %>%
+   RunPCA(verbose=F, assay='iAB', reduction.name='iAB.pca') %>%
+   FindMultiModalNeighbors(reduction.list=list('iRNA.pca', 'iAB.pca'), dims.list=list(1:30, 1:(nrow(skin[['AB']])-1)), verbose=F, weighted.nn.name='wnn') %>%
+   RunUMAP(nn.name='wnn', reduction.name='sub.iwumap', reduction.key='iwUMAP_', verbose=F) %>%
+   FindClusters(graph.name='wsnn', algorithm=3, resolution=0.1, verbose=F, cluster.name='Tcell.subcluster')
+
+# skin.t@meta.data$CD4.gated.subcluster = factor(skin.t@meta.data$CD4.gated.subcluster)
+# tab = with(subset(skin.t@meta.data), table(Tcell.subcluster, predicted.pbmc.l2))
+# perc = tab/rowSums(tab, na.rm=T)
+# sel = apply(perc, 2, max, na.rm=T)>.01
+# cbind(tab[,sel], rowSums(tab)) %>% kbl(col.names=c('# cells', colnames(tab)[sel], 'Σ')) %>% kable_classic(full_width=F)
+# round(perc[,sel]*100, 1) %>% kbl(col.names=c('%', colnames(tab)[sel])) %>% kable_classic(full_width=F)
+skin.t@meta.data$Tcell.subannotation = factor(skin.t@meta.data$Tcell.subcluster, labels=paste('skin', c('T_1 (mix)', 'T_2 (CD4 TCM/TEM)', 'T_3 (CD8 NK)', 'T_4 (CD4 TCM Treg)', 'T_5 (gdT ILC MAIT)', 'T_6 (mix)', 'T_7 (B)', 'T_8 (CD4 CTL CD8 TEM Treg)', 'T_9 (mix)', 'T_10 (DC CD14 Mono)', 'T_11 (mixed)')))
+DimPlot(skin.t, reduction="sub.iwumap", group.by='Tcell.subannotation', label=F, label.size=3, repel=T, shuffle=T, alpha=0.5)
+# skin.t@meta.data$Tcell.subannotation = factor(paste('skin', skin.t@meta.data$Tcell.subcluster))
+
+skin@meta.data$Tcell.subcluster = 'no T cell'
+skin@meta.data[rownames(skin.t@meta.data), ]$Tcell.subcluster = skin.t@meta.data$Tcell.subcluster
+skin@meta.data$Tcell.subcluster = factor(skin@meta.data$Tcell.subcluster)
+
+skin@meta.data$Tcell.subannotation = 'no T cell'
+skin@meta.data[rownames(skin.t@meta.data), ]$Tcell.subannotation = as.character(skin.t@meta.data$Tcell.subannotation)
+skin@meta.data$Tcell.subannotation = factor(skin@meta.data$Tcell.subannotation)
+                                   
+saveRDS(skin.t, 'data/skin.tcells.RDS')
+
+saveRDS(skin, 'data/skin.RDS')
+```
+Choose `skin.RDS` in the [Shiny UMAP](http://atlas.thlkn.de:3838/shiny-umap/).
